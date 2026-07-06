@@ -32,15 +32,8 @@ const shutdownDrainTimeout = 30 * time.Second
 // complete, letting the in-flight ones drain never leaves a partial output
 // behind — an interrupted batch simply stops early with no stray temp files.
 func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *logx.Logger) {
-	root := fsutil.AbsClean(cfg.Watcher.WatchDirectory)
-	ignoredDir, hasIgnored := conv.IgnoredDir()
-	rules := fsutil.TraversalRules{
-		Root:       root,
-		Recursive:  cfg.Watcher.Recursive,
-		MaxDepth:   cfg.Watcher.MaxDepth,
-		IgnoredDir: ignoredDir,
-		HasIgnored: hasIgnored,
-	}
+	rules := conv.TraversalRules()
+	root := rules.Root
 
 	files := collectPNGs(root, rules, log)
 	if len(files) == 0 {
@@ -105,15 +98,8 @@ func waitDone(wg *sync.WaitGroup) <-chan struct{} {
 // recursion/depth scope and, in output_folder mode, the output tree as well,
 // since that is where converted files (and thus their temps) are written.
 func SweepTemps(cfg config.Config, conv *convert.Converter, log *logx.Logger) {
-	root := fsutil.AbsClean(cfg.Watcher.WatchDirectory)
-	ignoredDir, hasIgnored := conv.IgnoredDir()
-	removed := sweepTree(root, fsutil.TraversalRules{
-		Root:       root,
-		Recursive:  cfg.Watcher.Recursive,
-		MaxDepth:   cfg.Watcher.MaxDepth,
-		IgnoredDir: ignoredDir,
-		HasIgnored: hasIgnored,
-	}, log)
+	rules := conv.TraversalRules()
+	removed := sweepTree(rules.Root, rules, log)
 
 	// In output_folder mode the converted files live under the output root,
 	// which the walk above deliberately excludes (or may never reach). Sweep it

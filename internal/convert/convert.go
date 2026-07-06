@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/nekogravitycat/auto-image-converter/internal/config"
+	"github.com/nekogravitycat/auto-image-converter/internal/fsutil"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
 )
 
@@ -44,8 +45,8 @@ func New(cfg config.Config, log *logx.Logger, heifScriptPath string) *Converter 
 		cfg:            cfg,
 		log:            log,
 		heifScriptPath: heifScriptPath,
-		watchRoot:      absClean(cfg.Watcher.WatchDirectory),
-		outputRoot:     absClean(cfg.FileManagement.OutputDirectory),
+		watchRoot:      fsutil.AbsClean(cfg.Watcher.WatchDirectory),
+		outputRoot:     fsutil.AbsClean(cfg.FileManagement.OutputDirectory),
 	}
 	if cfg.Converter.TargetFormat == config.FormatHEIF {
 		c.heifPool = newHeifPool(heifScriptPath, log, cfg.Converter.MaxWorkers)
@@ -88,6 +89,21 @@ func (c *Converter) IgnoredDir() (string, bool) {
 		return "", false // output root is outside the watch root; nothing to exclude
 	}
 	return c.outputRoot, true
+}
+
+// TraversalRules returns the directory-traversal scope shared by the watcher,
+// the startup batch, and the temp sweep: the watch root, the recursion/depth
+// settings, and the output subtree to exclude (when applicable). Centralizing
+// it here keeps those three callers from each re-deriving the same rules.
+func (c *Converter) TraversalRules() fsutil.TraversalRules {
+	ignoredDir, hasIgnored := c.IgnoredDir()
+	return fsutil.TraversalRules{
+		Root:       c.watchRoot,
+		Recursive:  c.cfg.Watcher.Recursive,
+		MaxDepth:   c.cfg.Watcher.MaxDepth,
+		IgnoredDir: ignoredDir,
+		HasIgnored: hasIgnored,
+	}
 }
 
 // IsPNG reports whether path has a .png extension (case-insensitive).

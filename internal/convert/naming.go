@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/nekogravitycat/auto-image-converter/internal/config"
+	"github.com/nekogravitycat/auto-image-converter/internal/fsutil"
 )
 
 // outputPath computes the destination path for a converted source file and
@@ -41,7 +42,7 @@ func (c *Converter) outputPath(srcPath string) (string, error) {
 // source file's location relative to the watch root. Sources outside the watch
 // root are placed directly in the output root.
 func (c *Converter) mirroredDir(srcPath string) string {
-	srcDir := filepath.Dir(absClean(srcPath))
+	srcDir := filepath.Dir(fsutil.AbsClean(srcPath))
 	rel, err := filepath.Rel(c.watchRoot, srcDir)
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
 		return c.outputRoot
@@ -69,13 +70,4 @@ func ensureUnique(path string) string {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-// absClean returns a cleaned absolute form of path, falling back to Clean when
-// the absolute path cannot be determined.
-func absClean(path string) string {
-	if abs, err := filepath.Abs(path); err == nil {
-		return filepath.Clean(abs)
-	}
-	return filepath.Clean(path)
 }

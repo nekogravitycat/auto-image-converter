@@ -56,21 +56,15 @@ func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *l
 	}
 	defer fsw.Close()
 
-	root := fsutil.AbsClean(cfg.Watcher.WatchDirectory)
-	ignoredDir, hasIgnored := conv.IgnoredDir()
+	rules := conv.TraversalRules()
+	root := rules.Root
 
 	w := &watcher{
-		cfg:  cfg,
-		conv: conv,
-		log:  log,
-		fsw:  fsw,
-		rules: fsutil.TraversalRules{
-			Root:       root,
-			Recursive:  cfg.Watcher.Recursive,
-			MaxDepth:   cfg.Watcher.MaxDepth,
-			IgnoredDir: ignoredDir,
-			HasIgnored: hasIgnored,
-		},
+		cfg:      cfg,
+		conv:     conv,
+		log:      log,
+		fsw:      fsw,
+		rules:    rules,
 		sem:      make(chan struct{}, cfg.Converter.MaxWorkers),
 		ctx:      ctx,
 		inFlight: make(map[string]bool),
@@ -186,13 +180,18 @@ func (w *watcher) schedule(path string) {
 			w.mu.Unlock()
 		}()
 
-		w.sem <- struct{}{}
-		defer func() { <-w.sem }()
-
+		// Wait for the file to finish being written *before* taking a worker
+		// slot. Readiness polling can last up to ~30s; holding a slot during it
+		// would let a few slowly-written files starve the pool so that no actual
+		// conversion can run. The slot bounds encoding concurrency, not waiting.
 		if !waitUntilReady(w.ctx, path) {
 			w.log.Warnf("file not ready or vanished, skipping: %s", path)
 			return
 		}
+
+		w.sem <- struct{}{}
+		defer func() { <-w.sem }()
+
 		if err := w.conv.Convert(path); err != nil {
 			w.log.Errorf("conversion failed for %s: %v", path, err)
 		}

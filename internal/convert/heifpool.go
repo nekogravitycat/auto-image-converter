@@ -174,7 +174,7 @@ func (p *heifPool) spawn() (*heifWorker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("HEIF worker: could not open stdout: %w", err)
 	}
-	stderr := &bytes.Buffer{}
+	stderr := &syncBuffer{}
 	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
@@ -220,6 +220,27 @@ func (p *heifPool) Close() {
 	}
 }
 
+// syncBuffer is a bytes.Buffer safe for concurrent use. It is needed because
+// os/exec fills a worker's stderr from an internal goroutine, while run may read
+// that same buffer (for a diagnostic) before the process is killed and waited —
+// so the write and the read can overlap. bytes.Buffer alone is not safe for that.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // heifWorker is a single long-lived Python process. It processes one job at a
 // time; exclusive access is guaranteed by the pool (a worker is only ever held
 // by one caller), so no per-worker lock is needed.
@@ -227,7 +248,7 @@ type heifWorker struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
-	stderr *bytes.Buffer
+	stderr *syncBuffer
 	broken bool // set when the worker can no longer be trusted for reuse
 }
 
