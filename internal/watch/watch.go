@@ -27,6 +27,12 @@ const (
 	readinessMaxAttempts = 75 // ~30s ceiling before giving up
 )
 
+// shutdownDrainTimeout bounds how long a graceful shutdown waits for in-flight
+// conversions before returning; a wedged conversion must not hang exit.
+// Stragglers are terminated by process shutdown (and the HEIF workers' cleanup
+// job).
+const shutdownDrainTimeout = 30 * time.Second
+
 // watcher holds the state needed to react to filesystem events.
 type watcher struct {
 	cfg      config.Config
@@ -35,6 +41,8 @@ type watcher struct {
 	fsw      *fsnotify.Watcher
 	rules    fsutil.TraversalRules
 	sem      chan struct{}
+	ctx      context.Context // cancelled on shutdown; drives graceful drain
+	wg       sync.WaitGroup  // tracks in-flight conversion goroutines
 	mu       sync.Mutex
 	inFlight map[string]bool
 }
@@ -64,6 +72,7 @@ func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *l
 			HasIgnored: hasIgnored,
 		},
 		sem:      make(chan struct{}, cfg.Converter.MaxWorkers),
+		ctx:      ctx,
 		inFlight: make(map[string]bool),
 	}
 
@@ -73,14 +82,18 @@ func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *l
 	for {
 		select {
 		case <-ctx.Done():
+			log.Infof("watcher: shutdown requested, waiting for in-flight conversions")
+			w.drain()
 			return nil
 		case event, ok := <-fsw.Events:
 			if !ok {
+				w.drain()
 				return nil
 			}
 			w.handleEvent(event)
 		case err, ok := <-fsw.Errors:
 			if !ok {
+				w.drain()
 				return nil
 			}
 			log.Errorf("watcher error: %v", err)
@@ -160,7 +173,13 @@ func (w *watcher) schedule(path string) {
 	w.inFlight[path] = true
 	w.mu.Unlock()
 
+	// Add to the wait group before launching so a shutdown that begins right now
+	// still drains this conversion. schedule is only ever called from the single
+	// event-loop goroutine, which stops (and only then calls wg.Wait) once ctx is
+	// cancelled, so Add never races with Wait.
+	w.wg.Add(1)
 	go func() {
+		defer w.wg.Done()
 		defer func() {
 			w.mu.Lock()
 			delete(w.inFlight, path)
@@ -170,7 +189,7 @@ func (w *watcher) schedule(path string) {
 		w.sem <- struct{}{}
 		defer func() { <-w.sem }()
 
-		if !waitUntilReady(path) {
+		if !waitUntilReady(w.ctx, path) {
 			w.log.Warnf("file not ready or vanished, skipping: %s", path)
 			return
 		}
@@ -180,10 +199,29 @@ func (w *watcher) schedule(path string) {
 	}()
 }
 
+// drain waits for in-flight conversion goroutines to finish, up to
+// shutdownDrainTimeout. Stragglers past the deadline are left to be terminated
+// by process exit (and the HEIF workers' cleanup job), so a wedged conversion
+// cannot hang shutdown.
+func (w *watcher) drain() {
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownDrainTimeout):
+		w.log.Warnf("watcher: in-flight conversions did not finish within %s; they will be terminated", shutdownDrainTimeout)
+	}
+}
+
 // waitUntilReady blocks until path appears fully written (its size is stable
 // across consecutive polls and it can be opened for reading) or a timeout is
-// reached. It returns false if the file never stabilizes or disappears.
-func waitUntilReady(path string) bool {
+// reached. It returns false if the file never stabilizes, disappears, or ctx is
+// cancelled — the last so a shutdown does not wait out the full readiness
+// ceiling for a file that is still being written.
+func waitUntilReady(ctx context.Context, path string) bool {
 	var lastSize int64 = -1
 	stable := 0
 
@@ -206,7 +244,11 @@ func waitUntilReady(path string) bool {
 			stable = 0
 		}
 		lastSize = size
-		time.Sleep(readinessInterval)
+		select {
+		case <-ctx.Done():
+			return false // shutting down; abandon this not-yet-ready file
+		case <-time.After(readinessInterval):
+		}
 	}
 	return false
 }

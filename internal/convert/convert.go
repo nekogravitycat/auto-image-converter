@@ -95,6 +95,15 @@ func IsPNG(path string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".png")
 }
 
+// IsTempFile reports whether path is an in-progress conversion temp file — one
+// this program writes while encoding and renames away once the output is
+// verified. A leftover temp means a previous run was killed mid-conversion; it
+// is always safe to delete, because the original PNG is only removed after a
+// successful rename, so the conversion simply gets redone. See batch.SweepTemps.
+func IsTempFile(path string) bool {
+	return strings.HasSuffix(path, tempSuffix)
+}
+
 // Convert converts a single PNG file and applies the post-conversion action.
 //
 // Non-PNG paths are ignored. On any failure the original file is left untouched

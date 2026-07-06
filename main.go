@@ -10,12 +10,11 @@ package main
 import (
 	"context"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"github.com/nekogravitycat/auto-image-converter/internal/batch"
 	"github.com/nekogravitycat/auto-image-converter/internal/config"
+	"github.com/nekogravitycat/auto-image-converter/internal/control"
 	"github.com/nekogravitycat/auto-image-converter/internal/convert"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
 	"github.com/nekogravitycat/auto-image-converter/internal/paths"
@@ -66,18 +65,26 @@ func main() {
 		log.Warnf("watch directory does not exist or is not a directory: %s", cfg.Watcher.WatchDirectory)
 	}
 
+	// Install shutdown handling up front so it is graceful during the startup
+	// batch too, not only once the watcher is running. NotifyStop reacts to a
+	// console interrupt and to the named stop event set by stop.ps1 — the latter
+	// being how this windowless process is normally asked to quit.
+	ctx, stop := control.NotifyStop(context.Background(), log)
+	defer stop()
+
+	// Clean up any *.converting.tmp orphaned by a previous run that was killed
+	// mid-conversion (crash, power loss, or hard kill). Safe to redo — the
+	// original PNG is only removed after a verified rename.
+	batch.SweepTemps(cfg, conv, log)
+
 	if cfg.Watcher.BatchOnStartup {
-		batch.Run(cfg, conv, log)
+		batch.Run(ctx, cfg, conv, log)
 	}
 
 	if !cfg.Watcher.Enabled {
 		log.Infof("background watching is disabled; exiting")
 		return
 	}
-
-	// Run the watcher until an interrupt/termination signal is received.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	if err := watch.Run(ctx, cfg, conv, log); err != nil {
 		log.Errorf("watcher stopped with error: %v", err)

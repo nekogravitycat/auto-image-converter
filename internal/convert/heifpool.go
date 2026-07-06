@@ -35,6 +35,11 @@ type heifPool struct {
 
 	slots chan struct{} // acquired for the duration of each job; bounds concurrency
 
+	// job terminates every worker process when this program exits, even under a
+	// hard kill; nil if the OS would not grant one (workers then still exit on
+	// stdin EOF at a normal shutdown).
+	job *killOnCloseJob
+
 	resolveOnce sync.Once
 	resolveErr  error
 
@@ -62,10 +67,16 @@ func newHeifPool(scriptPath string, log *logx.Logger, size int) *heifPool {
 	if size < 1 {
 		size = 1
 	}
+	job, err := newKillOnCloseJob()
+	if err != nil {
+		log.Warnf("HEIF workers: guaranteed-cleanup job unavailable (%v); workers still exit on stdin EOF at a normal shutdown", err)
+		job = nil
+	}
 	return &heifPool{
 		scriptPath: scriptPath,
 		log:        log,
 		slots:      make(chan struct{}, size),
+		job:        job,
 	}
 }
 
@@ -169,6 +180,14 @@ func (p *heifPool) spawn() (*heifWorker, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("HEIF worker: could not start %s: %w", p.python, err)
 	}
+	// Enroll the worker in the cleanup job so it cannot outlive the parent, even
+	// if the parent is force-killed. Best-effort: a worker that fails to enroll
+	// still exits on stdin EOF during an orderly shutdown.
+	if p.job != nil {
+		if err := p.job.assign(cmd.Process.Pid); err != nil {
+			p.log.Warnf("HEIF worker: could not enroll in cleanup job (%v); it may outlive a hard kill", err)
+		}
+	}
 	return &heifWorker{
 		cmd:    cmd,
 		stdin:  stdin,
@@ -193,6 +212,11 @@ func (p *heifPool) Close() {
 
 	for _, w := range free {
 		w.kill()
+	}
+	// Closing the job terminates any worker still checked out (e.g. one wedged
+	// mid-encode that never returned via put), guaranteeing none is left behind.
+	if p.job != nil {
+		p.job.close()
 	}
 }
 

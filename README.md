@@ -60,12 +60,20 @@ automatically at login, put a shortcut to the exe in your Startup folder
 ### Stopping the program
 
 Because the program runs with no console window, tray icon, or window, there is
-no button to close it. To stop it:
+no button to close it. The recommended way is:
 
-- Run the bundled helper script: `pwsh -File stop.ps1`, or
-- **Task Manager** (`Ctrl+Shift+Esc`) → Details → `auto-image-converter.exe` →
-  End task, or
-- PowerShell: `Stop-Process -Name auto-image-converter`
+- Run the bundled helper script: `pwsh -File stop.ps1`
+
+`stop.ps1` requests a **graceful shutdown**: it lets any in-flight conversions
+finish (so no partial `.converting.tmp` files are left behind) and shuts down the
+HEIF worker processes cleanly, only forcing the process if it does not exit
+within the grace period.
+
+You can still force-stop it via **Task Manager** (`Ctrl+Shift+Esc`) → Details →
+`auto-image-converter.exe` → End task, or `Stop-Process -Name auto-image-converter`.
+These skip the graceful drain, but nothing is lost: any leftover `.converting.tmp`
+is cleaned up automatically on the next startup, and the HEIF workers are
+terminated with the parent, so no orphan processes remain.
 
 ## Configuration (`config.yml`)
 
