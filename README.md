@@ -57,6 +57,12 @@ automatically at login, put a shortcut to the exe in your Startup folder
 > to the executable, not the current working directory — so launching from a
 > Startup shortcut works correctly.
 
+> **Single instance:** only one copy runs per user session. If a second copy is
+> launched (e.g. a duplicate Startup shortcut) it detects the running instance,
+> logs `another instance is already running; exiting`, and exits immediately —
+> so two watchers can never race on the same files. A crashed instance releases
+> the guard automatically, so the next launch is never blocked.
+
 ### Stopping the program
 
 Because the program runs with no console window, tray icon, or window, there is
@@ -97,8 +103,9 @@ file_management:
   output_directory: ""   # required only when post_action is "output_folder"
 ```
 
-`watch_directory` is the only field you must set. If it is empty (or blank), the
-program logs an error and exits without doing anything.
+`watch_directory` is the only field you must set. If it is empty (or blank), or
+points to a folder that does not exist, the program logs an error and exits
+without doing anything.
 
 ### Post-action modes
 
@@ -115,12 +122,21 @@ loops. Existing output names are never overwritten — a numeric suffix is added
 ## Resilience
 
 A missing, corrupt, or partially invalid `config.yml` never crashes the program:
-missing files are generated, unreadable ones fall back to safe defaults, and
-individual invalid fields are corrected and logged. The one field with no safe
-default is `watch_directory`: if it is empty, the program logs an error and exits
-rather than guessing a folder to monitor. If HEIF is selected but its runtime
-(Python + `pillow-heif`) is unavailable, the startup environment check reports the
-cause, conversions fail safely, and originals are kept.
+
+- **Missing file** — generated with defaults.
+- **Unreadable / not valid YAML** — safe defaults are used for this run and the
+  file is left untouched (so a hand-fixable mistake is never destroyed).
+- **Partially invalid** — every value that can be read is kept; any setting that
+  is missing, unrecognized, the wrong type, or out of range falls back to its
+  default. The file is then rewritten in clean, complete form (valid values
+  preserved, defaults for the rest) and each correction is logged. This is
+  idempotent: once repaired, a later start finds nothing to fix.
+
+The one field with no safe default is `watch_directory`: if it is empty or points
+to a non-existent folder, the program logs an error and exits rather than
+guessing a folder to monitor. If HEIF is selected but its runtime (Python +
+`pillow-heif`) is unavailable, the startup environment check reports the cause,
+conversions fail safely, and originals are kept.
 
 ## Development
 

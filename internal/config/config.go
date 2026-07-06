@@ -9,6 +9,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -79,10 +80,15 @@ type FileManagementConfig struct {
 // Behavior:
 //   - If the file does not exist, a default file is generated at path and the
 //     defaults are returned.
-//   - If the file cannot be read or parsed, safe defaults are returned together
-//     with a non-nil error (the caller should log it and continue).
-//   - Otherwise the file is parsed and validated; invalid fields are corrected
-//     and returned as warnings.
+//   - If the file cannot be read, or is not valid YAML at all, safe defaults are
+//     returned together with a non-nil error (the caller should log it and
+//     continue).
+//   - Otherwise the file is parsed leniently: every value that can be read is
+//     kept, and any setting that is missing, of the wrong type, unrecognized, or
+//     out of range falls back to its default. When any such correction was
+//     needed the file is rewritten in clean, complete, canonical form (valid
+//     values preserved, defaults for the rest) and each correction is reported
+//     as a warning.
 //
 // Load never panics.
 func Load(path string) (cfg Config, warnings []string, err error) {
@@ -98,12 +104,162 @@ func Load(path string) (cfg Config, warnings []string, err error) {
 		return SafeDefaults(), nil, fmt.Errorf("could not read config at %s: %w", path, readErr)
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return SafeDefaults(), nil, fmt.Errorf("config at %s is corrupt: %w", path, err)
+	// Parse leniently into a pointer-field mirror so that a genuinely absent key
+	// (nil) is distinguishable from one explicitly set to its zero value — which
+	// matters for the boolean fields whose default (true) is not their zero value
+	// (false). A type mismatch on an individual field yields a *yaml.TypeError,
+	// leaves that field nil, and is recoverable; only a real syntax error, which
+	// makes nothing readable, is fatal.
+	var raw rawConfig
+	if uErr := yaml.Unmarshal(data, &raw); uErr != nil {
+		var te *yaml.TypeError
+		if !errors.As(uErr, &te) {
+			return SafeDefaults(), nil, fmt.Errorf("config at %s is corrupt: %w", path, uErr)
+		}
 	}
 
-	warnings = cfg.applyDefaultsAndValidate()
+	var missing []string
+	cfg, missing = raw.toConfig()
+	for _, name := range missing {
+		warnings = append(warnings, fmt.Sprintf("setting %s is missing or invalid; using default", name))
+	}
+	for _, name := range detectUnknownFields(data) {
+		warnings = append(warnings, fmt.Sprintf("unrecognized setting %q; ignoring it", name))
+	}
+
+	warnings = append(warnings, cfg.applyDefaultsAndValidate()...)
+
+	// If the file was missing keys, carried unrecognized keys, or held values we
+	// had to correct, rewrite it in clean, complete, canonical form — preserving
+	// every value we could read and filling the rest with defaults. The result is
+	// idempotent: a subsequent load finds nothing to fix and does not rewrite.
+	if len(warnings) > 0 {
+		if wErr := writeDefault(path, cfg); wErr != nil {
+			warnings = append(warnings, fmt.Sprintf("could not rewrite cleaned config at %s: %v", path, wErr))
+		} else {
+			warnings = append(warnings, fmt.Sprintf("rewrote %s with the valid values, defaults for the rest", path))
+		}
+	}
 	return cfg, warnings, nil
+}
+
+// rawConfig mirrors Config but with pointer fields, so Load can tell a missing
+// key (nil) apart from one present with a zero value. This distinction matters
+// for the boolean watcher fields, whose default is true rather than their zero
+// value of false.
+type rawConfig struct {
+	Watcher        rawWatcher        `yaml:"watcher"`
+	Converter      rawConverter      `yaml:"converter"`
+	FileManagement rawFileManagement `yaml:"file_management"`
+}
+
+type rawWatcher struct {
+	WatchDirectory *string `yaml:"watch_directory"`
+	Enabled        *bool   `yaml:"enabled"`
+	BatchOnStartup *bool   `yaml:"batch_on_startup"`
+	Recursive      *bool   `yaml:"recursive"`
+	MaxDepth       *int    `yaml:"max_depth"`
+}
+
+type rawConverter struct {
+	TargetFormat *string `yaml:"target_format"`
+	Quality      *int    `yaml:"quality"`
+	MaxWorkers   *int    `yaml:"max_workers"`
+}
+
+type rawFileManagement struct {
+	PostAction      *string `yaml:"post_action"`
+	OutputDirectory *string `yaml:"output_directory"`
+}
+
+// toConfig converts the leniently-parsed raw form into a full Config, filling
+// every absent (or wrong-typed, hence nil) field from the defaults and returning
+// the dotted names of the fields it had to fill. Range/enum validation of the
+// values that *were* present is left to applyDefaultsAndValidate.
+func (r rawConfig) toConfig() (Config, []string) {
+	cfg := defaultConfig()
+	var missing []string
+
+	set := func(present bool, name string) bool {
+		if present {
+			return true
+		}
+		missing = append(missing, name)
+		return false
+	}
+
+	if set(r.Watcher.WatchDirectory != nil, "watcher.watch_directory") {
+		cfg.Watcher.WatchDirectory = *r.Watcher.WatchDirectory
+	}
+	if set(r.Watcher.Enabled != nil, "watcher.enabled") {
+		cfg.Watcher.Enabled = *r.Watcher.Enabled
+	}
+	if set(r.Watcher.BatchOnStartup != nil, "watcher.batch_on_startup") {
+		cfg.Watcher.BatchOnStartup = *r.Watcher.BatchOnStartup
+	}
+	if set(r.Watcher.Recursive != nil, "watcher.recursive") {
+		cfg.Watcher.Recursive = *r.Watcher.Recursive
+	}
+	if set(r.Watcher.MaxDepth != nil, "watcher.max_depth") {
+		cfg.Watcher.MaxDepth = *r.Watcher.MaxDepth
+	}
+
+	if set(r.Converter.TargetFormat != nil, "converter.target_format") {
+		cfg.Converter.TargetFormat = *r.Converter.TargetFormat
+	}
+	if set(r.Converter.Quality != nil, "converter.quality") {
+		cfg.Converter.Quality = *r.Converter.Quality
+	}
+	if set(r.Converter.MaxWorkers != nil, "converter.max_workers") {
+		cfg.Converter.MaxWorkers = *r.Converter.MaxWorkers
+	}
+
+	if set(r.FileManagement.PostAction != nil, "file_management.post_action") {
+		cfg.FileManagement.PostAction = *r.FileManagement.PostAction
+	}
+	if set(r.FileManagement.OutputDirectory != nil, "file_management.output_directory") {
+		cfg.FileManagement.OutputDirectory = *r.FileManagement.OutputDirectory
+	}
+
+	return cfg, missing
+}
+
+// detectUnknownFields reports the names of keys in the YAML that do not
+// correspond to any known setting. It is best-effort and never affects the
+// values already parsed — only the warnings and the decision to rewrite. It is
+// called only after the lenient parse has confirmed the YAML is syntactically
+// valid, so the strict decoder here can only surface field-level problems.
+func detectUnknownFields(data []byte) []string {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+
+	var raw rawConfig
+	var te *yaml.TypeError
+	if err := dec.Decode(&raw); !errors.As(err, &te) {
+		return nil
+	}
+
+	var fields []string
+	for _, msg := range te.Errors {
+		// KnownFields violations read "line N: field NAME not found in type ...";
+		// type-mismatch errors (already handled as missing) are ignored here.
+		if strings.Contains(msg, "not found in type") {
+			fields = append(fields, unknownFieldName(msg))
+		}
+	}
+	return fields
+}
+
+// unknownFieldName extracts the offending key from a yaml KnownFields error
+// message of the form "line N: field NAME not found in type ...".
+func unknownFieldName(msg string) string {
+	const pre, post = "field ", " not found"
+	i := strings.Index(msg, pre)
+	j := strings.Index(msg, post)
+	if i >= 0 && j > i+len(pre) {
+		return msg[i+len(pre) : j]
+	}
+	return strings.TrimSpace(msg)
 }
 
 // OutputExtension returns the file extension (including the dot) for the
@@ -210,9 +366,18 @@ func SafeDefaults() Config {
 	return c
 }
 
-// writeDefault writes a commented default configuration file to path.
+// writeDefault writes cfg to path as a commented YAML file. It is used both to
+// generate the initial config and to rewrite a partially-invalid one, so it
+// serializes every field from cfg rather than assuming defaults — otherwise a
+// rewrite would silently reset values the user had set correctly.
 func writeDefault(path string, cfg Config) error {
-	content := fmt.Sprintf(`# Auto Image Converter Configuration File
+	return os.WriteFile(path, []byte(renderConfig(cfg)), 0o644)
+}
+
+// renderConfig produces the commented config-file contents for cfg, preserving
+// all of its values.
+func renderConfig(cfg Config) string {
+	return fmt.Sprintf(`# Auto Image Converter Configuration File
 
 # Watcher and Runtime Modes
 watcher:
@@ -220,28 +385,33 @@ watcher:
   # It is empty by default and the program will NOT run until you fill it in.
   # Example: "C:\\Users\\YourUsername\\Pictures\\Screenshots"
   watch_directory: "%s"
-  enabled: true          # Enable real-time background monitoring
-  batch_on_startup: true # Convert existing PNGs once at startup
-  recursive: true        # Also watch subfolders
-  max_depth: 0           # 0 = unlimited; N = at most N levels below the watch root
+  enabled: %t          # Enable real-time background monitoring
+  batch_on_startup: %t # Convert existing PNGs once at startup
+  recursive: %t        # Also watch subfolders
+  max_depth: %d           # 0 = unlimited; N = at most N levels below the watch root
 
 # Conversion Core Settings
 converter:
-  target_format: "JPEG"  # Target format. Supported: JPEG (no external tool), HEIF (needs Python + pillow-heif)
+  target_format: "%s"  # Target format. Supported: JPEG (no external tool), HEIF (needs Python + pillow-heif)
   quality: %d            # Image quality, range 1-100
   max_workers: %d         # Maximum concurrent workers for the startup batch
 
 # Post-Conversion File Management
 file_management:
-  post_action: "replace" # Supported: replace (convert in place, delete original), output_folder (convert into output_directory, keep original)
+  post_action: "%s" # Supported: replace (convert in place, delete original), output_folder (convert into output_directory, keep original)
   output_directory: "%s" # Used when post_action is "output_folder"
 `,
 		yamlPath(cfg.Watcher.WatchDirectory),
+		cfg.Watcher.Enabled,
+		cfg.Watcher.BatchOnStartup,
+		cfg.Watcher.Recursive,
+		cfg.Watcher.MaxDepth,
+		cfg.Converter.TargetFormat,
 		cfg.Converter.Quality,
 		cfg.Converter.MaxWorkers,
+		cfg.FileManagement.PostAction,
 		yamlPath(cfg.FileManagement.OutputDirectory),
 	)
-	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 // yamlPath escapes a Windows path for embedding inside a double-quoted YAML
