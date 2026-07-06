@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,50 +35,18 @@ func findPython() (string, error) {
 		strings.Join(pythonCandidates, ", "))
 }
 
-// encodeHEIFFile converts the image at srcPath into a HEIF file at dstPath by
-// running the bundled heif_convert.py script through the system Python
-// interpreter (which must have pillow-heif installed).
+// encodeHEIFFile converts the image at srcPath into a HEIF file at dstPath using
+// a warm worker from the HEIF pool (a long-lived Python process with pillow-heif
+// already imported).
 //
 // pillow-heif's own EXIF/ICC passthrough is relied upon for HEIF metadata
-// (best-effort). Any non-zero exit code — or a timeout — is treated as a
-// failure so the caller leaves the original file untouched.
+// (best-effort). Any worker error, conversion failure, or timeout is treated as
+// a failure so the caller leaves the original file untouched.
 func (c *Converter) encodeHEIFFile(srcPath, dstPath string) error {
-	python, err := findPython()
-	if err != nil {
-		return fmt.Errorf("cannot encode HEIF: %w", err)
+	if c.heifPool == nil {
+		return fmt.Errorf("cannot encode HEIF: worker pool not initialized")
 	}
-	if _, err := os.Stat(c.heifScriptPath); err != nil {
-		return fmt.Errorf("HEIF conversion script not available at %s: %w", c.heifScriptPath, err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), heifEncodeTimeout)
-	defer cancel()
-
-	// heif_convert.py CLI: heif_convert.py -q <quality> -o <output> <input>.
-	// Arguments are passed directly (no shell), so paths need no escaping and
-	// cannot be interpreted as commands.
-	cmd := exec.CommandContext(ctx, python, c.heifScriptPath,
-		"-q", strconv.Itoa(c.cfg.Converter.Quality),
-		"-o", dstPath,
-		srcPath,
-	)
-	// Prevent a console window from flashing when invoking the interpreter.
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("HEIF conversion timed out after %s for %s", heifEncodeTimeout, srcPath)
-		}
-		detail := strings.TrimSpace(stderr.String())
-		if detail != "" {
-			return fmt.Errorf("HEIF conversion failed for %s: %w: %s", srcPath, err, detail)
-		}
-		return fmt.Errorf("HEIF conversion failed for %s: %w", srcPath, err)
-	}
-	return nil
+	return c.heifPool.encode(srcPath, dstPath, c.cfg.Converter.Quality)
 }
 
 // checkHEIFEnvironment verifies that HEIF conversion can actually run: a Python

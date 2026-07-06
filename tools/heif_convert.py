@@ -13,6 +13,19 @@ Requirements (installed by the user, intentionally not bundled):
 Usage:
     python heif_convert.py -q <quality> -o <output.heic> <input.png>
     python heif_convert.py --check          # self-test the environment
+    python heif_convert.py --serve          # persistent worker mode (see below)
+
+Persistent worker mode (--serve):
+    Imports the (expensive) imaging backend once, then serves an unbounded
+    stream of conversion jobs so the Go caller never pays repeated interpreter
+    startup + import costs. Protocol is newline-delimited JSON over stdin/stdout:
+
+        stdin  (one request per line):  {"src": "in.png", "dst": "out.heic", "quality": 90}
+        stdout (one response per line): {"ok": true}
+                                        {"ok": false, "error": "..."}
+
+    One response is written per request, in order. stdout carries responses
+    only; all diagnostics go to stderr. The worker exits 0 on stdin EOF.
 
 Exit codes:
     0  success
@@ -25,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import sys
 
 
@@ -83,27 +97,82 @@ def cmd_check() -> int:
     return 0
 
 
+def _convert_one(Image, src: str, dst: str, quality: int) -> None:
+    """Convert ``src`` to HEIF at ``dst``, raising on any failure.
+
+    The HEIF opener must already be registered by the caller. Metadata is
+    carried over best-effort and never fails the encode.
+    """
+    with Image.open(src) as img:
+        img.load()
+        out = _normalize(img)
+        save_kwargs = {"quality": quality}
+        exif = img.info.get("exif")
+        if exif:
+            save_kwargs["exif"] = exif
+        icc = img.info.get("icc_profile")
+        if icc:
+            save_kwargs["icc_profile"] = icc
+        out.save(dst, format="HEIF", **save_kwargs)
+
+
 def cmd_convert(src: str, dst: str, quality: int) -> int:
-    """Convert the image at ``src`` to HEIF at ``dst``."""
+    """Convert the image at ``src`` to HEIF at ``dst`` (one-shot mode)."""
     Image, pillow_heif = _load()
     pillow_heif.register_heif_opener()
     try:
-        with Image.open(src) as img:
-            img.load()
-            out = _normalize(img)
-            save_kwargs = {"quality": quality}
-            # Best-effort metadata passthrough; never fail the encode over it.
-            exif = img.info.get("exif")
-            if exif:
-                save_kwargs["exif"] = exif
-            icc = img.info.get("icc_profile")
-            if icc:
-                save_kwargs["icc_profile"] = icc
-            out.save(dst, format="HEIF", **save_kwargs)
+        _convert_one(Image, src, dst, quality)
     except FileNotFoundError:
         return _fail(3, f"input file not found: {src}")
     except Exception as exc:  # noqa: BLE001 - surface any decode/encode error
         return _fail(3, f"HEIF conversion failed: {exc}")
+    return 0
+
+
+def cmd_serve() -> int:
+    """Persistent worker: convert an unbounded stream of jobs from stdin.
+
+    See the module docstring for the newline-delimited JSON protocol. The
+    expensive imports happen once, up front; each subsequent job reuses the
+    already-warm interpreter, which is the whole point of this mode.
+    """
+    Image, pillow_heif = _load()
+    pillow_heif.register_heif_opener()
+
+    # Force UTF-8 with '\n' line endings in both directions so non-ASCII paths
+    # (e.g. Chinese folder names) survive on Windows, where the console default
+    # is a legacy code page and text mode would otherwise translate newlines.
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    except AttributeError:
+        pass  # very old Python; fall back to whatever the defaults are
+
+    def respond(ok: bool, error: str | None = None) -> None:
+        msg = {"ok": ok}
+        if error:
+            msg["error"] = error
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            src = req["src"]
+            dst = req["dst"]
+            quality = max(1, min(100, int(req.get("quality", 90))))
+        except (ValueError, KeyError, TypeError) as exc:
+            respond(False, f"bad request: {exc}")
+            continue
+        try:
+            _convert_one(Image, src, dst, quality)
+            respond(True)
+        except Exception as exc:  # noqa: BLE001 - report, but keep the worker alive
+            respond(False, str(exc))
+
     return 0
 
 
@@ -114,6 +183,8 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--check", action="store_true",
                         help="verify the environment and exit")
+    parser.add_argument("--serve", action="store_true",
+                        help="persistent worker mode: stream jobs as JSON over stdin/stdout")
     parser.add_argument("-q", "--quality", type=int, default=90,
                         help="encoder quality, 1-100 (default: 90)")
     parser.add_argument("-o", "--output", help="output HEIF path")
@@ -122,6 +193,9 @@ def main(argv: list[str]) -> int:
 
     if args.check:
         return cmd_check()
+
+    if args.serve:
+        return cmd_serve()
 
     if not args.output or not args.input:
         parser.print_usage(sys.stderr)

@@ -52,6 +52,7 @@ func main() {
 	}
 
 	conv := convert.New(cfg, log, appPaths.HeifScriptPath())
+	defer conv.Close()
 	if err := conv.ValidateEnvironment(); err != nil {
 		// HEIF is selected but its runtime (Python + pillow-heif + the bundled
 		// script) is not ready. Conversions will fail safely, leaving originals

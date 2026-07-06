@@ -21,6 +21,7 @@ func TestHEIFIntegration(t *testing.T) {
 	log, _ := logx.New(filepath.Join(t.TempDir(), "t.log"))
 	defer log.Close()
 	c := New(cfg, log, script)
+	defer c.Close()
 
 	if err := c.checkHEIFEnvironment(); err != nil {
 		t.Skipf("HEIF environment not available: %v", err)

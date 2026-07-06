@@ -6,10 +6,17 @@ sit next to `auto-image-converter.exe` at runtime.
 
 ## heif_convert.py (required only for HEIF output)
 
-When `converter.target_format` is set to `HEIF`, the application shells out to
+When `converter.target_format` is set to `HEIF`, the application runs
 `heif_convert.py`, a small script that encodes HEIF via
 [pillow-heif](https://pypi.org/project/pillow-heif/). The script is committed to
 the repository and ships with the app — you do **not** need to supply it.
+
+To keep conversions fast, the app does **not** start a fresh interpreter per
+image. Instead it launches a small pool of persistent workers (one per
+`converter.max_workers`) that each import pillow-heif once and then convert an
+unbounded stream of images (`heif_convert.py --serve`). This is what stops a
+large startup batch from saturating the CPU with repeated Python startup +
+import work. The workers are shut down when the app exits.
 
 JPEG output works out of the box with no external tools, so HEIF is treated as
 an opt-in choice for advanced users: enabling it means providing a Python
@@ -47,11 +54,20 @@ files are always left untouched.
 
 ### Direct usage
 
-The application calls the script like this (arguments are passed directly, with
-no shell, so paths need no escaping):
+At runtime the app drives the script in persistent worker mode, but the script
+also supports a one-shot invocation (handy for testing a single file):
 
 ```powershell
 python tools\heif_convert.py -q <quality 1-100> -o <output.heic> <input.png>
+```
+
+Persistent worker mode (`--serve`), used internally, streams jobs as
+newline-delimited JSON over stdin and writes one JSON response per job to
+stdout:
+
+```text
+stdin  -> {"src": "in.png", "dst": "out.heic", "quality": 90}
+stdout <- {"ok": true}   |   {"ok": false, "error": "..."}
 ```
 
 Exit codes: `0` success · `2` environment not ready · `3` conversion failed ·

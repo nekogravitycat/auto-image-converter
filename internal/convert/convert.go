@@ -28,19 +28,37 @@ type Converter struct {
 	cfg            config.Config
 	log            *logx.Logger
 	heifScriptPath string
+	heifPool       *heifPool
 	watchRoot      string
 	outputRoot     string
 }
 
 // New creates a Converter. heifScriptPath is the absolute path to the bundled
 // HEIF conversion script, used only when HEIF output is selected.
+//
+// When HEIF output is configured, a pool of warm Python workers is prepared so
+// each conversion reuses an already-imported interpreter instead of paying the
+// startup cost per file. Callers must invoke Close to shut the pool down.
 func New(cfg config.Config, log *logx.Logger, heifScriptPath string) *Converter {
-	return &Converter{
+	c := &Converter{
 		cfg:            cfg,
 		log:            log,
 		heifScriptPath: heifScriptPath,
 		watchRoot:      absClean(cfg.Watcher.WatchDirectory),
 		outputRoot:     absClean(cfg.FileManagement.OutputDirectory),
+	}
+	if cfg.Converter.TargetFormat == config.FormatHEIF {
+		c.heifPool = newHeifPool(heifScriptPath, log, cfg.Converter.MaxWorkers)
+	}
+	return c
+}
+
+// Close releases resources held by the Converter, shutting down any HEIF worker
+// processes. It is safe to call even when no pool was created, and more than
+// once.
+func (c *Converter) Close() {
+	if c.heifPool != nil {
+		c.heifPool.Close()
 	}
 }
 
