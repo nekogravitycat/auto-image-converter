@@ -33,6 +33,21 @@ func main() {
 
 	log.Infof("Auto Image Converter starting (base directory: %s)", appPaths.BaseDir)
 
+	// Refuse to run a second copy in the same session. Two instances watching
+	// the same tree would race on the shared "*.converting.tmp" name and on
+	// output naming, which can corrupt output or delete an original twice. If the
+	// guard itself cannot be established we log and continue rather than block
+	// startup — losing the protection is better than refusing to run at all.
+	lock, ok, err := control.AcquireSingleInstance()
+	if err != nil {
+		log.Warnf("could not establish single-instance guard (%v); continuing without it", err)
+	} else if !ok {
+		log.Errorf("another instance is already running; exiting")
+		return
+	} else {
+		defer lock.Release()
+	}
+
 	cfg, warnings, err := config.Load(appPaths.ConfigFile)
 	if err != nil {
 		log.Errorf("configuration problem: %v", err)
@@ -50,6 +65,12 @@ func main() {
 		return
 	}
 
+	if info, statErr := os.Stat(cfg.Watcher.WatchDirectory); statErr != nil || !info.IsDir() {
+		log.Errorf("watch_directory does not exist or is not a directory: %s; set it to an existing folder in %s, then restart",
+			cfg.Watcher.WatchDirectory, appPaths.ConfigFile)
+		return
+	}
+
 	conv := convert.New(cfg, log, appPaths.HeifScriptPath())
 	defer conv.Close()
 	if err := conv.ValidateEnvironment(); err != nil {
@@ -59,10 +80,6 @@ func main() {
 		log.Errorf("%v", err)
 		log.Errorf("HEIF conversions will fail until Python and pillow-heif are installed (pip install pillow-heif) and tools/%s is present; originals will be kept",
 			paths.HeifScriptName)
-	}
-
-	if info, statErr := os.Stat(cfg.Watcher.WatchDirectory); statErr != nil || !info.IsDir() {
-		log.Warnf("watch directory does not exist or is not a directory: %s", cfg.Watcher.WatchDirectory)
 	}
 
 	// Install shutdown handling up front so it is graceful during the startup
