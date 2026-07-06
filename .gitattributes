@@ -1,0 +1,32 @@
+# Normalize line endings so the repository is byte-for-byte consistent across
+# platforms regardless of each developer's core.autocrlf setting. LF is used
+# both in the repository and in the working tree: it matches gofmt's output and
+# keeps Git from reporting "LF will be replaced by CRLF" on Windows checkouts.
+* text=auto eol=lf
+
+# Source and text formats — explicit for clarity (and to override any global
+# per-user attributes a contributor might have).
+*.go    text eol=lf
+*.mod   text eol=lf
+*.sum   text eol=lf
+*.py    text eol=lf
+*.ps1   text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
+# Binary formats Git must never try to normalize or diff as text. This program
+# handles images, so guard the likely fixture/output types explicitly.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.heic  binary
+*.heif  binary
+*.ico   binary
+*.exe   binary
+*.dll   binary
