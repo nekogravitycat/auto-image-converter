@@ -28,7 +28,14 @@ type InstanceLock struct {
 // The distinguishing signal is that CreateMutex returns a valid handle *and*
 // ERROR_ALREADY_EXISTS when a mutex of the same name already exists.
 func AcquireSingleInstance() (lock *InstanceLock, ok bool, err error) {
-	name, err := windows.UTF16PtrFromString(SingleInstanceMutexName)
+	return acquireNamedInstance(SingleInstanceMutexName)
+}
+
+// acquireNamedInstance is AcquireSingleInstance parameterized by mutex name, so
+// tests can exercise the real Win32 path on a name of their own instead of the
+// application's — which the running application itself may already own.
+func acquireNamedInstance(mutexName string) (lock *InstanceLock, ok bool, err error) {
+	name, err := windows.UTF16PtrFromString(mutexName)
 	if err != nil {
 		return nil, false, err
 	}
