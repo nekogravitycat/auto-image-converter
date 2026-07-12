@@ -19,8 +19,8 @@ func TestLoadGeneratesDefault(t *testing.T) {
 	if len(warnings) == 0 {
 		t.Errorf("expected a warning about generating the default config")
 	}
-	if cfg.Version != currentVersion {
-		t.Errorf("default version = %d, want %d", cfg.Version, currentVersion)
+	if cfg.Version != CurrentVersion {
+		t.Errorf("default version = %d, want %d", cfg.Version, CurrentVersion)
 	}
 	if len(cfg.Jobs) != 0 {
 		t.Errorf("fresh config should have no jobs, got %d", len(cfg.Jobs))

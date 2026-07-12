@@ -20,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/fsutil"
@@ -32,18 +34,30 @@ import (
 const tempSuffix = ".converting.tmp"
 
 // Engine holds the resources shared across all jobs: the global worker
-// semaphore that bounds total concurrent conversions, and (when any job targets
-// HEIF) the single warm Python worker pool. It is safe for concurrent use.
+// semaphore that bounds total concurrent conversions, and the single warm Python
+// worker pool used for HEIF output. It is safe for concurrent use.
 type Engine struct {
 	log            *logx.Logger
 	heifScriptPath string
-	heifPool       *heifPool     // shared; nil when no job targets HEIF
+	maxWorkers     int
 	sem            chan struct{} // global shared worker pool, cap = maxWorkers
 	// onResult, when set, is invoked once for every attempted conversion (both
 	// success and failure), so a single hook can drive statistics and the UI
 	// activity feed. It must be set before any job starts and be safe for
 	// concurrent use.
 	onResult func(Result, error)
+
+	// The HEIF pool is created on first use rather than up front, so that every
+	// path that can ask for HEIF gets one — including an ad-hoc (drag-and-drop)
+	// conversion, which is not a configured job and therefore cannot be predicted
+	// when the engine is built.
+	heifMu   sync.Mutex
+	heifPool *heifPool
+	closed   bool
+
+	// tempSeq makes each in-progress temp file name unique, so two conversions
+	// that target the same output name never write to the same temp path.
+	tempSeq atomic.Uint64
 }
 
 // SetResultHook registers a callback invoked after each conversion attempt. Call
@@ -53,32 +67,63 @@ func (e *Engine) SetResultHook(fn func(Result, error)) {
 }
 
 // NewEngine creates the shared conversion engine. maxWorkers sizes both the
-// global worker semaphore and (when usesHEIF) the HEIF worker pool. When any job
-// targets HEIF, a pool of warm Python workers is prepared so each conversion
-// reuses an already-imported interpreter instead of paying the startup cost per
-// file. Callers must invoke Close to shut the pool down.
-func NewEngine(maxWorkers int, usesHEIF bool, log *logx.Logger, heifScriptPath string) *Engine {
+// global worker semaphore and the HEIF worker pool. Callers must invoke Close to
+// shut the pool down.
+func NewEngine(maxWorkers int, log *logx.Logger, heifScriptPath string) *Engine {
 	if maxWorkers < 1 {
 		maxWorkers = 1
 	}
-	e := &Engine{
+	return &Engine{
 		log:            log,
 		heifScriptPath: heifScriptPath,
+		maxWorkers:     maxWorkers,
 		sem:            make(chan struct{}, maxWorkers),
 	}
-	if usesHEIF {
-		e.heifPool = newHeifPool(heifScriptPath, log, maxWorkers)
+}
+
+// heif returns the shared HEIF worker pool, creating it on first use. A pool of
+// warm Python workers means each conversion reuses an already-imported
+// interpreter instead of paying the startup cost per file.
+func (e *Engine) heif() (*heifPool, error) {
+	e.heifMu.Lock()
+	defer e.heifMu.Unlock()
+	if e.closed {
+		return nil, fmt.Errorf("cannot encode HEIF: the conversion engine is closed")
 	}
-	return e
+	if e.heifPool == nil {
+		e.heifPool = newHeifPool(e.heifScriptPath, e.log, e.maxWorkers)
+	}
+	return e.heifPool, nil
+}
+
+// WarmHEIF creates the HEIF worker pool ahead of the first conversion, so a job
+// that is known to target HEIF does not pay the interpreter startup cost on its
+// first file. It is optional: the pool is created on demand regardless.
+func (e *Engine) WarmHEIF() {
+	_, _ = e.heif()
 }
 
 // Close releases resources held by the Engine, shutting down any HEIF worker
 // processes. It is safe to call even when no pool was created, and more than
-// once.
+// once. After Close, HEIF conversions fail rather than resurrecting the pool.
 func (e *Engine) Close() {
-	if e.heifPool != nil {
-		e.heifPool.Close()
+	e.heifMu.Lock()
+	pool := e.heifPool
+	e.heifPool = nil
+	e.closed = true
+	e.heifMu.Unlock()
+
+	if pool != nil {
+		pool.Close()
 	}
+}
+
+// Closed reports whether the engine has been closed. Owners use it to assert
+// that an engine is not shut down while conversions are still running through it.
+func (e *Engine) Closed() bool {
+	e.heifMu.Lock()
+	defer e.heifMu.Unlock()
+	return e.closed
 }
 
 // Acquire takes a slot in the global worker pool, blocking until one is free.
@@ -89,15 +134,13 @@ func (e *Engine) Acquire() { e.sem <- struct{}{} }
 // Release returns a slot taken by Acquire.
 func (e *Engine) Release() { <-e.sem }
 
-// ValidateHEIF checks that external dependencies required for HEIF output are
-// available, but only when at least one job targets HEIF (i.e. the pool exists).
-// When HEIF is not in use it is a no-op.
+// ValidateHEIF checks that the external dependencies required for HEIF output
+// (a Python interpreter, the bundled script, and a working pillow-heif) are
+// available. Callers invoke it when something is known to target HEIF, so the
+// cause is reported once at startup instead of once per failed screenshot.
 func (e *Engine) ValidateHEIF() error {
-	if e.heifPool == nil {
-		return nil
-	}
-	if err := e.checkHEIFEnvironment(); err != nil {
-		return fmt.Errorf("a job targets HEIF but the HEIF conversion environment is not ready: %w", err)
+	if err := checkHEIFEnvironment(e.heifScriptPath); err != nil {
+		return fmt.Errorf("HEIF output is selected but the HEIF conversion environment is not ready: %w", err)
 	}
 	return nil
 }
@@ -152,14 +195,19 @@ func (s JobSpec) OutputExtension() string {
 // IgnoredDir returns the absolute output directory that must be excluded from
 // watching and scanning to prevent conversion loops, and whether such exclusion
 // applies. Exclusion applies only in output_folder mode when the output
-// directory lies within the watch root.
+// directory lies strictly within the watch root.
+//
+// An output directory equal to the watch root is deliberately not excluded:
+// there the job means "write the converted file next to its source but keep the
+// original", and every source mirrors onto its own directory. Excluding it
+// would exclude the entire tree, silently converting nothing.
 func (s JobSpec) IgnoredDir() (string, bool) {
 	if s.PostAction != config.ActionOutputFolder {
 		return "", false
 	}
 	rel, err := filepath.Rel(s.WatchDir, s.OutputDir)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", false // output root is outside the watch root; nothing to exclude
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false // same as, or outside, the watch root; nothing to exclude
 	}
 	return s.OutputDir, true
 }
@@ -220,11 +268,15 @@ func (e *Engine) convert(spec JobSpec, srcPath string) (Result, error) {
 		origSize = info.Size()
 	}
 
-	finalPath, err := spec.outputPath(srcPath)
+	desiredPath, err := spec.outputPath(srcPath)
 	if err != nil {
 		return Result{Src: srcPath}, err
 	}
-	tmpPath := finalPath + tempSuffix
+
+	// The temp name carries a per-engine sequence number, so two conversions
+	// racing for the same output name (possible whenever distinct sources share a
+	// base name and a destination directory) never write to the same temp file.
+	tmpPath := fmt.Sprintf("%s.%d%s", desiredPath, e.tempSeq.Add(1), tempSuffix)
 
 	if err := e.encodeTo(spec, srcPath, tmpPath); err != nil {
 		removeQuietly(tmpPath)
@@ -238,8 +290,19 @@ func (e *Engine) convert(spec JobSpec, srcPath string) (Result, error) {
 		return Result{Src: srcPath}, fmt.Errorf("conversion produced no valid output for %s", srcPath)
 	}
 
+	// Reserve the output name only now that there is something to put there, and
+	// reserve it atomically (create-exclusive) rather than by testing for absence
+	// — two concurrent conversions must not both decide the same name is free.
+	finalPath, err := claimOutputName(desiredPath)
+	if err != nil {
+		removeQuietly(tmpPath)
+		return Result{Src: srcPath}, err
+	}
+
+	// Renaming over the reservation we just made is atomic on Windows.
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		removeQuietly(tmpPath)
+		removeQuietly(finalPath) // drop the empty reservation
 		return Result{Src: srcPath}, fmt.Errorf("could not finalize output %s: %w", finalPath, err)
 	}
 

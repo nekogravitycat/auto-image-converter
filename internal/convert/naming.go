@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,15 +11,14 @@ import (
 	"github.com/nekogravitycat/auto-image-converter/internal/fsutil"
 )
 
-// outputPath computes the destination path for a converted source file and
-// ensures the containing directory exists.
+// outputPath computes the preferred destination path for a converted source file
+// and ensures the containing directory exists. The name is not yet reserved —
+// see claimOutputName, which resolves collisions at the moment the output is
+// ready to be put in place.
 //
 //   - In replace mode the output sits next to the source.
 //   - In output_folder mode the source's subpath relative to the watch root is
 //     mirrored under the output directory, preserving nested structure.
-//
-// The returned path is guaranteed not to collide with an existing file: if the
-// natural name is taken, a numeric suffix is appended (e.g. shot-1.jpg).
 func (s JobSpec) outputPath(srcPath string) (string, error) {
 	ext := s.OutputExtension()
 	stem := strings.TrimSuffix(filepath.Base(srcPath), filepath.Ext(srcPath))
@@ -35,7 +35,7 @@ func (s JobSpec) outputPath(srcPath string) (string, error) {
 		return "", fmt.Errorf("could not create output directory %s: %w", destDir, err)
 	}
 
-	return ensureUnique(filepath.Join(destDir, fileName)), nil
+	return filepath.Join(destDir, fileName), nil
 }
 
 // mirroredDir returns the directory under the output root that mirrors the
@@ -50,24 +50,36 @@ func (s JobSpec) mirroredDir(srcPath string) string {
 	return filepath.Join(s.OutputDir, rel)
 }
 
-// ensureUnique returns path unchanged if no file exists there; otherwise it
-// appends "-1", "-2", ... before the extension until an unused name is found.
-func ensureUnique(path string) string {
-	if !fileExists(path) {
-		return path
-	}
-	ext := filepath.Ext(path)
-	stem := strings.TrimSuffix(path, ext)
-	for i := 1; ; i++ {
-		candidate := fmt.Sprintf("%s-%d%s", stem, i, ext)
-		if !fileExists(candidate) {
-			return candidate
+// maxNameAttempts bounds the search for a free output name, so a pathological
+// directory cannot spin forever.
+const maxNameAttempts = 10000
+
+// claimOutputName reserves an unused output name at or near desired and returns
+// it. It creates the file exclusively (O_CREATE|O_EXCL) rather than testing for
+// absence first: two conversions racing for the same name must not both conclude
+// it is free, which is exactly what happens when distinct sources share a base
+// name and a destination directory. The winner keeps `desired`; the loser moves
+// on to "-1", "-2", and so on.
+//
+// The reservation is an empty file. The caller renames the finished output over
+// it (atomic on Windows) or, on failure, removes it.
+func claimOutputName(desired string) (string, error) {
+	ext := filepath.Ext(desired)
+	stem := strings.TrimSuffix(desired, ext)
+
+	for i := 0; i < maxNameAttempts; i++ {
+		candidate := desired
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
+		}
+		f, err := os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			f.Close()
+			return candidate, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return "", fmt.Errorf("could not create output %s: %w", candidate, err)
 		}
 	}
-}
-
-// fileExists reports whether a file or directory exists at path.
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+	return "", fmt.Errorf("could not find an unused output name for %s after %d attempts", desired, maxNameAttempts)
 }

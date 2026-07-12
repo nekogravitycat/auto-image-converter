@@ -24,6 +24,7 @@ import (
 	"github.com/nekogravitycat/auto-image-converter/internal/autostart"
 	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/convert"
+	"github.com/nekogravitycat/auto-image-converter/internal/humanize"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
 	"github.com/nekogravitycat/auto-image-converter/internal/manager"
 )
@@ -45,7 +46,16 @@ type UI struct {
 	pauseAction *walk.Action
 
 	loading bool // suppresses change handlers while initializing controls
+
+	// workersTimer debounces the parallel-workers field (see onWorkersChanged).
+	workersTimer *time.Timer
 }
+
+// workersApplyDelay is how long the parallel-workers field must sit still before
+// the change is applied. A NumberEdit reports every intermediate value while the
+// user types or holds the spinner, and each distinct value rebuilds the shared
+// worker pool, so "8" on the way to "16" should not cost a rebuild.
+const workersApplyDelay = 600 * time.Millisecond
 
 // Run builds the window and tray, wires up and starts the manager, and runs the
 // message loop until the user chooses Exit or ctx is cancelled (an OS
@@ -273,8 +283,8 @@ func (u *UI) refreshStats() {
 	ss, ls := u.mgr.Stats()
 	u.statsLabel.SetText(fmt.Sprintf(
 		"Session: %d converted, %d failed, %s saved     |     Total: %d converted, %s saved",
-		ss.Converted, ss.Failed, humanBytes(ss.BytesSaved),
-		ls.Converted, humanBytes(ls.BytesSaved)))
+		ss.Converted, ss.Failed, humanize.Bytes(ss.BytesSaved),
+		ls.Converted, humanize.Bytes(ls.BytesSaved)))
 }
 
 func (u *UI) refreshPauseLabel() {
@@ -344,11 +354,18 @@ func (u *UI) onRemove() {
 	u.refreshTable()
 }
 
+// onWorkersChanged applies the new worker count once the field settles. It runs
+// on the GUI thread, so the timer needs no lock; SetMaxWorkers is safe to call
+// from the timer's goroutine.
 func (u *UI) onWorkersChanged() {
 	if u.loading {
 		return
 	}
-	u.mgr.SetMaxWorkers(int(u.workersEdit.Value()))
+	n := int(u.workersEdit.Value())
+	if u.workersTimer != nil {
+		u.workersTimer.Stop()
+	}
+	u.workersTimer = time.AfterFunc(workersApplyDelay, func() { u.mgr.SetMaxWorkers(n) })
 }
 
 func (u *UI) onStartMinChanged() {
@@ -451,16 +468,3 @@ func expandPNGs(paths []string) []string {
 	return out
 }
 
-// humanBytes formats a byte count as a short human-readable string.
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for x := n / unit; x >= unit; x /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
-}

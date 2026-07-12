@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/convert"
 	"github.com/nekogravitycat/auto-image-converter/internal/fsutil"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
@@ -150,8 +151,9 @@ func SweepTemps(spec convert.JobSpec, log *logx.Logger) int {
 	// fully so temps there are cleaned up too.
 	if ignored, ok := spec.IgnoredDir(); ok {
 		removed += sweepTree(ignored, fsutil.TraversalRules{Root: ignored, Recursive: true}, log)
-	} else if spec.PostAction != "replace" && spec.OutputDir != "" {
-		// output_folder mode with the output root outside the watch tree.
+	} else if spec.PostAction == config.ActionOutputFolder && spec.OutputDir != "" {
+		// output_folder mode with the output root outside the watch tree (the
+		// case where it is inside is covered by the branch above).
 		removed += sweepTree(spec.OutputDir, fsutil.TraversalRules{Root: spec.OutputDir, Recursive: true}, log)
 	}
 

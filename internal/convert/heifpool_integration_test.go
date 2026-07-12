@@ -23,10 +23,10 @@ func newHEIFTestEngine(t *testing.T, workers int) *Engine {
 	log, _ := logx.New(filepath.Join(t.TempDir(), "t.log"))
 	t.Cleanup(func() { log.Close() })
 
-	e := NewEngine(workers, true, log, script)
+	e := NewEngine(workers, log, script)
 	t.Cleanup(e.Close)
 
-	if err := e.checkHEIFEnvironment(); err != nil {
+	if err := checkHEIFEnvironment(script); err != nil {
 		t.Skipf("HEIF environment not available: %v", err)
 	}
 	return e

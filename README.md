@@ -28,7 +28,9 @@ and post-action, and either watch a folder continuously or convert it just once.
 - **Launch at login** — a checkbox toggles a per-user startup entry (no manual
   shortcut needed).
 - **Background watcher** — reacts to new PNGs the moment they are written, using
-  `fsnotify` (event-driven, no polling); new subfolders are picked up at runtime.
+  `fsnotify` (event-driven, no polling); new subfolders are picked up at runtime,
+  including any PNGs they already contain (moving a folder of screenshots into a
+  watched folder produces no per-file events, so it is scanned once on arrival).
 - **JPEG or HEIF output** — JPEG uses Go's native encoder (no external tools);
   HEIF uses a bundled Python script backed by `pillow-heif`.
 - **Transparency-safe** — transparent PNGs are composited onto white before JPEG
@@ -139,8 +141,12 @@ from the window.
 
 In `output_folder` mode, if the output directory lives inside the watched tree,
 it is automatically excluded from watching and scanning to avoid conversion
-loops. Existing output names are never overwritten — a numeric suffix is added
-(e.g. `shot-1.jpg`).
+loops. Setting it *to* the watched folder itself is allowed and simply means
+"write the converted file next to its source but keep the original".
+
+Existing output names are never overwritten — a numeric suffix is added (e.g.
+`shot-1.jpg`). The name is reserved atomically, so two files converting at the
+same time into the same folder can never collide on it.
 
 ## Resilience
 

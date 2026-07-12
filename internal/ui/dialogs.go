@@ -247,14 +247,19 @@ func dropOnceDialog(owner walk.Form, fileCount int) (convert.JobSpec, bool) {
 		return convert.JobSpec{}, false
 	}
 
-	spec := convert.JobSpec{
-		Name:         "Drag & drop",
-		TargetFormat: formatValues[formatCombo.CurrentIndex()],
-		Quality:      int(qualityEdit.Value()),
-		PostAction:   actionValues[actionCombo.CurrentIndex()],
-		OutputDir:    strings.TrimSpace(outputEdit.Text()),
-	}
-	return spec, true
+	// Go through a JobConfig rather than hand-building the spec, so an ad-hoc
+	// conversion gets exactly the same validation and path normalization as a
+	// configured folder. The watch directory stays empty: the dropped files are
+	// an explicit list with no common root, so in output_folder mode they all
+	// land directly in the output folder.
+	jc, _ := config.NormalizeJob(config.JobConfig{
+		Name:            "Drag & drop",
+		TargetFormat:    formatValues[formatCombo.CurrentIndex()],
+		Quality:         int(qualityEdit.Value()),
+		PostAction:      actionValues[actionCombo.CurrentIndex()],
+		OutputDirectory: strings.TrimSpace(outputEdit.Text()),
+	})
+	return convert.SpecFromJob(jc), true
 }
 
 // AlreadyRunningAlert tells the user that another copy owns the single-instance

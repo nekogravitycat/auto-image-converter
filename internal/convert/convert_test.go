@@ -9,7 +9,10 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+
+	"github.com/nekogravitycat/auto-image-converter/internal/config"
 )
 
 // pngChunk builds a single PNG chunk: length, type, data, CRC.
@@ -103,19 +106,103 @@ func TestCompositeAndOpaque(t *testing.T) {
 	}
 }
 
-func TestEnsureUnique(t *testing.T) {
+// An output folder equal to the watch folder means "write next to the source but
+// keep the original". It must not be treated as an excluded subtree: excluding it
+// would exclude the whole tree and the job would silently convert nothing.
+func TestIgnoredDirNotAppliedWhenOutputIsTheWatchRoot(t *testing.T) {
+	dir := t.TempDir()
+	spec := SpecFromJob(config.JobConfig{
+		WatchDirectory:  dir,
+		OutputDirectory: dir,
+		PostAction:      config.ActionOutputFolder,
+		TargetFormat:    config.FormatJPEG,
+		Quality:         90,
+		Recursive:       true,
+	})
+
+	if got, ok := spec.IgnoredDir(); ok {
+		t.Errorf("IgnoredDir() = (%q, true), want no exclusion when output == watch root", got)
+	}
+	if spec.TraversalRules().PruneDir(dir) {
+		t.Error("PruneDir pruned the watch root, so the job would convert nothing")
+	}
+}
+
+// A nested output directory, by contrast, must be excluded so it is not rescanned.
+func TestIgnoredDirAppliedWhenOutputIsNested(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "converted")
+	spec := SpecFromJob(config.JobConfig{
+		WatchDirectory:  dir,
+		OutputDirectory: out,
+		PostAction:      config.ActionOutputFolder,
+		TargetFormat:    config.FormatJPEG,
+		Quality:         90,
+		Recursive:       true,
+	})
+
+	got, ok := spec.IgnoredDir()
+	if !ok || got != out {
+		t.Errorf("IgnoredDir() = (%q, %v), want (%q, true)", got, ok, out)
+	}
+	if !spec.TraversalRules().PruneDir(out) {
+		t.Error("PruneDir did not prune the nested output directory")
+	}
+}
+
+func TestClaimOutputName(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "shot.jpg")
 
-	if got := ensureUnique(p); got != p {
-		t.Errorf("ensureUnique on free path = %q, want %q", got, p)
-	}
-
-	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+	got, err := claimOutputName(p)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if got != p {
+		t.Errorf("claimOutputName on free path = %q, want %q", got, p)
+	}
+	// The claim must actually exist, otherwise it reserves nothing.
+	if _, err := os.Stat(p); err != nil {
+		t.Errorf("claimed name was not created: %v", err)
+	}
+
 	want := filepath.Join(dir, "shot-1.jpg")
-	if got := ensureUnique(p); got != want {
-		t.Errorf("ensureUnique on taken path = %q, want %q", got, want)
+	got, err = claimOutputName(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("claimOutputName on taken path = %q, want %q", got, want)
+	}
+}
+
+// Concurrent claims for the same name must all get distinct files: this is what
+// stops two conversions of same-named sources from clobbering each other.
+func TestClaimOutputNameIsRaceFree(t *testing.T) {
+	dir := t.TempDir()
+	desired := filepath.Join(dir, "shot.jpg")
+
+	const n = 16
+	var wg sync.WaitGroup
+	names := make([]string, n)
+	errs := make([]error, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			names[i], errs[i] = claimOutputName(desired)
+		}()
+	}
+	wg.Wait()
+
+	seen := make(map[string]bool, n)
+	for i := range n {
+		if errs[i] != nil {
+			t.Fatalf("claim %d failed: %v", i, errs[i])
+		}
+		if seen[names[i]] {
+			t.Fatalf("two claims returned the same name %q", names[i])
+		}
+		seen[names[i]] = true
 	}
 }

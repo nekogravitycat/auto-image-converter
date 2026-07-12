@@ -24,9 +24,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// currentVersion is the schema version written into generated files. It exists
-// so future format changes can be detected; there is no legacy migration.
-const currentVersion = 1
+// CurrentVersion is the schema version written into generated files. It exists
+// so future format changes can be detected; there is no legacy migration. It is
+// exported so every writer of a config (including the manager, which persists
+// the live settings) stamps the same version.
+const CurrentVersion = 1
 
 // Supported target formats.
 const (
@@ -365,7 +367,7 @@ func (c *Config) applyDefaultsAndValidate() []string {
 	var warnings []string
 
 	if c.Version == 0 {
-		c.Version = currentVersion
+		c.Version = CurrentVersion
 	}
 
 	if c.App.MaxWorkers < 1 {
@@ -458,7 +460,7 @@ func deriveJobName(watchDir string, index int) string {
 // baseDefaults returns the shared default configuration with an empty job list.
 func baseDefaults() Config {
 	return Config{
-		Version: currentVersion,
+		Version: CurrentVersion,
 		App: AppConfig{
 			MaxWorkers:     defaultWorkers,
 			StartMinimized: true,

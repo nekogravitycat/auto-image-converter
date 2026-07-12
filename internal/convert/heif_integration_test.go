@@ -18,10 +18,10 @@ func TestHEIFIntegration(t *testing.T) {
 	script, _ := filepath.Abs(filepath.Join("..", "..", "tools", "heif_convert.py"))
 	log, _ := logx.New(filepath.Join(t.TempDir(), "t.log"))
 	defer log.Close()
-	e := NewEngine(1, true, log, script)
+	e := NewEngine(1, log, script)
 	defer e.Close()
 
-	if err := e.checkHEIFEnvironment(); err != nil {
+	if err := checkHEIFEnvironment(script); err != nil {
 		t.Skipf("HEIF environment not available: %v", err)
 	}
 

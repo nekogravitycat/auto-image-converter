@@ -17,11 +17,13 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/nekogravitycat/auto-image-converter/internal/autostart"
 	"github.com/nekogravitycat/auto-image-converter/internal/batch"
 	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/convert"
+	"github.com/nekogravitycat/auto-image-converter/internal/humanize"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
 	"github.com/nekogravitycat/auto-image-converter/internal/stats"
 	"github.com/nekogravitycat/auto-image-converter/internal/watch"
@@ -40,6 +42,61 @@ type runner struct {
 	spec   convert.JobSpec
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+// engineHandle owns one convert.Engine and reference-counts its users, so an
+// engine is only closed once nothing is still converting through it.
+//
+// This matters because the engine is rebuilt whenever the worker count changes,
+// while background batches hold on to whichever engine they started with. Closing
+// an engine out from under a running batch would shut down its HEIF workers
+// mid-conversion and fail every remaining file. Instead the old engine is
+// retired: new work goes to the replacement, and the old one closes itself once
+// its last user is done.
+type engineHandle struct {
+	eng *convert.Engine
+
+	mu      sync.Mutex
+	users   int
+	retired bool
+}
+
+// use registers a user of the engine. The caller must invoke done when finished.
+// Callers take a handle and call use while holding the manager's lock, so a
+// concurrent retire can never slip in between the two.
+func (h *engineHandle) use() *convert.Engine {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.users++
+	return h.eng
+}
+
+// done releases a user, closing the engine if it was retired and this was the
+// last one.
+func (h *engineHandle) done() {
+	h.mu.Lock()
+	h.users--
+	closeNow := h.retired && h.users == 0
+	h.mu.Unlock()
+	if closeNow {
+		h.eng.Close()
+	}
+}
+
+// retire marks the engine as superseded: it is closed as soon as its last user
+// finishes, or immediately if it has none.
+func (h *engineHandle) retire() {
+	h.mu.Lock()
+	if h.retired {
+		h.mu.Unlock()
+		return
+	}
+	h.retired = true
+	closeNow := h.users == 0
+	h.mu.Unlock()
+	if closeNow {
+		h.eng.Close()
+	}
 }
 
 // Manager is the application coordinator. Construct it with New.
@@ -61,9 +118,9 @@ type Manager struct {
 	log   *logx.Logger
 	stats *stats.Stats
 
-	eng        *convert.Engine
-	engWorkers int
-	engHEIF    bool
+	eng         *engineHandle
+	engWorkers  int
+	heifChecked bool // the HEIF environment self-test runs at most once per run
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -95,7 +152,7 @@ func New(cfg config.Config, cfgPath, statsPath, heifScriptPath, exePath string, 
 		m.jobs = append(m.jobs, &JobState{ID: m.nextID, Cfg: jc, Status: "idle"})
 		m.nextID++
 	}
-	m.buildEngine(cfg.App.MaxWorkers, cfg.UsesHEIF())
+	m.buildEngine(cfg.App.MaxWorkers)
 	return m
 }
 
@@ -147,6 +204,13 @@ func (m *Manager) Stats() (session, lifetime stats.Snapshot) {
 // begins watching the enabled monitor jobs. It returns promptly; the work runs
 // in the background.
 func (m *Manager) Start() {
+	m.mu.Lock()
+	closed := m.closed
+	m.mu.Unlock()
+	if closed {
+		return
+	}
+
 	for _, j := range m.Jobs() {
 		spec := convert.SpecFromJob(j.Cfg)
 		batch.SweepTemps(spec, m.log)
@@ -157,7 +221,42 @@ func (m *Manager) Start() {
 			m.runBatch(spec, nil, j.Cfg.Name, true)
 		}
 	}
+	m.startStatsSaver()
 	m.triggerReconcile()
+}
+
+// statsSaveInterval is how often lifetime totals are flushed while the app runs.
+// Without it, files converted by a watcher would only be persisted when a batch
+// happens to finish or at a graceful shutdown — so a force-kill would lose them.
+const statsSaveInterval = 30 * time.Second
+
+// startStatsSaver periodically persists the lifetime statistics until shutdown.
+func (m *Manager) startStatsSaver() {
+	// Join the wait group under the lock that Shutdown uses to set closed, so the
+	// counter is never raised after Shutdown has begun waiting on it.
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.wg.Done()
+		t := time.NewTicker(statsSaveInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-m.rootCtx.Done():
+				return
+			case <-t.C:
+				if err := m.stats.Save(); err != nil {
+					m.log.Warnf("could not save stats: %v", err)
+				}
+			}
+		}
+	}()
 }
 
 // Shutdown cancels all work, waits for in-flight conversions to drain (bounded
@@ -183,10 +282,12 @@ func (m *Manager) Shutdown() {
 	m.wg.Wait()
 
 	m.mu.Lock()
-	eng := m.eng
+	h := m.eng
 	m.mu.Unlock()
-	if eng != nil {
-		eng.Close()
+	if h != nil {
+		// Every batch and watcher has finished, so this closes the engine (and its
+		// HEIF workers) immediately.
+		h.retire()
 	}
 	if err := m.stats.Save(); err != nil {
 		m.log.Warnf("could not save stats: %v", err)
@@ -252,12 +353,18 @@ func (m *Manager) SetJobEnabled(id int, enabled bool) {
 	m.triggerReconcile()
 }
 
-// SetMaxWorkers changes the shared worker-pool size, rebuilding the engine.
+// SetMaxWorkers changes the shared worker-pool size, rebuilding the engine. An
+// unchanged value is ignored, so a UI that reports every keystroke does not
+// rebuild the engine (and restart the HEIF workers) for nothing.
 func (m *Manager) SetMaxWorkers(n int) {
 	if n < 1 {
 		n = 1
 	}
 	m.mu.Lock()
+	if m.app.MaxWorkers == n {
+		m.mu.Unlock()
+		return
+	}
 	m.app.MaxWorkers = n
 	m.persistLocked()
 	m.mu.Unlock()
@@ -347,12 +454,23 @@ func (m *Manager) runBatch(spec convert.JobSpec, files []string, label string, n
 		return
 	}
 	ctx := m.rootCtx
-	eng := m.eng
+	// Claim the engine under the lock: a reconcile that swaps in a replacement
+	// can then only retire this one, never close it while the batch is running.
+	h := m.eng
+	eng := h.use()
 	m.wg.Add(1)
 	m.mu.Unlock()
 
+	if spec.TargetFormat == config.FormatHEIF {
+		go m.checkHEIFEnvironment()
+	}
+
 	go func() {
+		// Defers run last-in-first-out: release the engine before the wait group,
+		// so Shutdown's Wait returning means every engine user is gone too.
 		defer m.wg.Done()
+		defer h.done()
+
 		var sum batch.Summary
 		if files == nil {
 			sum = batch.Run(ctx, spec, eng, m.log)
@@ -391,25 +509,32 @@ func (m *Manager) reconcile() {
 	for i, j := range m.jobs {
 		snap[i] = *j
 	}
-	eng := m.eng
-	needRebuild := desiredWorkers != m.engWorkers || desiredHEIF != m.engHEIF
+	h := m.eng
+	needRebuild := desiredWorkers != m.engWorkers
 	m.mu.Unlock()
 
 	if needRebuild {
 		m.stopAllRunners()
-		eng = m.buildEngine(desiredWorkers, desiredHEIF)
+		h = m.buildEngine(desiredWorkers)
+	}
+	eng := h.eng
+
+	if desiredHEIF {
+		go m.checkHEIFEnvironment()
 	}
 
 	// Desired running set: enabled monitor jobs with an existing folder, unless
-	// paused.
+	// paused. A job whose folder is gone is recorded as failed so the status set
+	// here survives the refresh below.
 	desired := make(map[int]convert.JobSpec)
+	failed := make(map[int]string)
 	for i := range snap {
 		j := snap[i]
 		if paused || !j.Cfg.Enabled || j.Cfg.Mode != config.ModeMonitor {
 			continue
 		}
 		if !dirExists(j.Cfg.WatchDirectory) {
-			m.setStatus(j.ID, "error: watch folder not found")
+			failed[j.ID] = "error: watch folder not found"
 			continue
 		}
 		desired[j.ID] = convert.SpecFromJob(j.Cfg)
@@ -427,20 +552,21 @@ func (m *Manager) reconcile() {
 	for id, spec := range desired {
 		if _, ok := m.running[id]; !ok {
 			m.running[id] = m.startRunner(eng, spec, id)
-			m.setStatus(id, "monitoring")
 		}
 	}
 
-	// Refresh statuses for jobs that are not watching.
+	// Refresh the status of every job in one pass: watching, failed, or one of
+	// the not-watching states.
 	m.mu.Lock()
 	for _, j := range m.jobs {
-		if _, running := m.running[j.ID]; running {
-			continue
+		switch {
+		case m.running[j.ID] != nil:
+			j.Status = "monitoring"
+		case failed[j.ID] != "":
+			j.Status = failed[j.ID]
+		default:
+			j.Status = statusFor(j.Cfg, m.paused)
 		}
-		if _, errored := desired[j.ID]; errored {
-			continue // desired but couldn't start (dir missing) — status already set
-		}
-		j.Status = statusFor(j.Cfg, m.paused)
 	}
 	m.mu.Unlock()
 
@@ -474,30 +600,48 @@ func (m *Manager) stopAllRunners() {
 	}
 }
 
-// buildEngine closes any existing engine and builds a new one sized to workers,
-// wiring the stats hook and validating the HEIF environment when needed. It
-// records the engine parameters so reconcile can detect future changes.
-func (m *Manager) buildEngine(workers int, usesHEIF bool) *convert.Engine {
+// buildEngine builds an engine sized to workers, installs it as the current one,
+// and retires the previous one (which closes as soon as any batch still using it
+// finishes). It records the worker count so reconcile can detect future changes.
+func (m *Manager) buildEngine(workers int) *engineHandle {
+	eng := convert.NewEngine(workers, m.log, m.heifScriptPath)
+	eng.SetResultHook(m.recordResult)
+	h := &engineHandle{eng: eng}
+
 	m.mu.Lock()
 	old := m.eng
+	m.eng = h
+	m.engWorkers = workers
 	m.mu.Unlock()
-	if old != nil {
-		old.Close()
-	}
 
-	eng := convert.NewEngine(workers, usesHEIF, m.log, m.heifScriptPath)
-	eng.SetResultHook(m.recordResult)
-	if err := eng.ValidateHEIF(); err != nil {
+	if old != nil {
+		old.retire()
+	}
+	return h
+}
+
+// checkHEIFEnvironment runs the HEIF self-test once per run, the first time
+// anything targets HEIF, so a missing Python or pillow-heif is reported clearly
+// rather than as one failure per screenshot. It is slow (it starts an
+// interpreter), so it runs off the reconcile path.
+func (m *Manager) checkHEIFEnvironment() {
+	m.mu.Lock()
+	if m.heifChecked || m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.heifChecked = true
+	h := m.eng
+	m.mu.Unlock()
+
+	if err := h.eng.ValidateHEIF(); err != nil {
 		m.log.Errorf("%v", err)
 		m.log.Errorf("HEIF conversions will fail until Python and pillow-heif are installed (pip install pillow-heif); originals will be kept")
+		return
 	}
-
-	m.mu.Lock()
-	m.eng = eng
-	m.engWorkers = workers
-	m.engHEIF = usesHEIF
-	m.mu.Unlock()
-	return eng
+	// The environment is good: pay the interpreter startup cost now rather than
+	// on the first screenshot.
+	h.eng.WarmHEIF()
 }
 
 // recordResult feeds every conversion outcome into the statistics.
@@ -542,7 +686,7 @@ func (m *Manager) persistLocked() {
 	for i, j := range m.jobs {
 		jobs[i] = j.Cfg
 	}
-	cfg := config.Config{Version: 1, App: m.app, Jobs: jobs}
+	cfg := config.Config{Version: config.CurrentVersion, App: m.app, Jobs: jobs}
 	if err := config.Save(m.cfgPath, cfg); err != nil {
 		m.log.Errorf("could not save config to %s: %v", m.cfgPath, err)
 	}
@@ -572,10 +716,10 @@ func (m *Manager) notifyBatch(label string, s batch.Summary) {
 	}
 	if s.Failed > 0 {
 		m.postNotify("Conversion finished with errors",
-			fmt.Sprintf("%s: %d converted, %d failed, %s saved", label, s.Converted, s.Failed, humanBytes(s.BytesSaved)), true)
+			fmt.Sprintf("%s: %d converted, %d failed, %s saved", label, s.Converted, s.Failed, humanize.Bytes(s.BytesSaved)), true)
 	} else {
 		m.postNotify("Conversion complete",
-			fmt.Sprintf("%s: %d converted, %s saved", label, s.Converted, humanBytes(s.BytesSaved)), false)
+			fmt.Sprintf("%s: %d converted, %s saved", label, s.Converted, humanize.Bytes(s.BytesSaved)), false)
 	}
 }
 
@@ -599,18 +743,4 @@ func dirExists(path string) bool {
 	}
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
-}
-
-// humanBytes formats a byte count as a short human-readable string.
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for x := n / unit; x >= unit; x /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }

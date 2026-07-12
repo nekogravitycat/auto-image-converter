@@ -37,16 +37,17 @@ func findPython() (string, error) {
 
 // encodeHEIFFile converts the image at srcPath into a HEIF file at dstPath using
 // a warm worker from the HEIF pool (a long-lived Python process with pillow-heif
-// already imported).
+// already imported). The pool is created on first use.
 //
 // pillow-heif's own EXIF/ICC passthrough is relied upon for HEIF metadata
 // (best-effort). Any worker error, conversion failure, or timeout is treated as
 // a failure so the caller leaves the original file untouched.
 func (e *Engine) encodeHEIFFile(srcPath, dstPath string, quality int) error {
-	if e.heifPool == nil {
-		return fmt.Errorf("cannot encode HEIF: worker pool not initialized")
+	pool, err := e.heif()
+	if err != nil {
+		return err
 	}
-	return e.heifPool.encode(srcPath, dstPath, quality)
+	return pool.encode(srcPath, dstPath, quality)
 }
 
 // checkHEIFEnvironment verifies that HEIF conversion can actually run: a Python
@@ -55,19 +56,19 @@ func (e *Engine) encodeHEIFFile(srcPath, dstPath string, quality int) error {
 //
 // It is a startup guard: catching the problem here means a clear, actionable
 // message is logged once, instead of every screenshot failing silently later.
-func (e *Engine) checkHEIFEnvironment() error {
+func checkHEIFEnvironment(scriptPath string) error {
 	python, err := findPython()
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(e.heifScriptPath); err != nil {
-		return fmt.Errorf("HEIF conversion script not found at %s: %w", e.heifScriptPath, err)
+	if _, err := os.Stat(scriptPath); err != nil {
+		return fmt.Errorf("HEIF conversion script not found at %s: %w", scriptPath, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), heifCheckTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, python, e.heifScriptPath, "--check")
+	cmd := exec.CommandContext(ctx, python, scriptPath, "--check")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	var stderr bytes.Buffer
