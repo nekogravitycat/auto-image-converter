@@ -83,9 +83,10 @@ click **Add folder…**, pick a folder and settings, and it starts working.
 > directory — so launching from a Startup entry works correctly.
 
 > **Single instance:** only one copy runs per user session. A second launch
-> detects the running instance, logs `another instance is already running;
-> exiting`, and exits, so two watchers can never race on the same files. A
-> crashed instance releases the guard automatically.
+> detects the running instance, shows a message box pointing you at the tray
+> icon, logs `another instance is already running; exiting`, and exits, so two
+> watchers can never race on the same files. A crashed instance releases the
+> guard automatically.
 
 ### Stopping the program
 

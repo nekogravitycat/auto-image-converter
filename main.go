@@ -42,7 +42,10 @@ func main() {
 	if err != nil {
 		log.Warnf("could not establish single-instance guard (%v); continuing without it", err)
 	} else if !ok {
+		// Without a console there is nothing to see, so tell the user why this
+		// launch does nothing before exiting.
 		log.Errorf("another instance is already running; exiting")
+		ui.AlreadyRunningAlert()
 		return
 	} else {
 		defer lock.Release()

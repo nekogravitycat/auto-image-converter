@@ -257,6 +257,17 @@ func dropOnceDialog(owner walk.Form, fileCount int) (convert.JobSpec, bool) {
 	return spec, true
 }
 
+// AlreadyRunningAlert tells the user that another copy owns the single-instance
+// guard, so this launch is about to exit. It is called before any window or tray
+// icon exists: MsgBox with a nil owner goes straight to the Win32 MessageBox, so
+// it needs no message loop. Topmost/foreground keep it visible when the launch
+// came from a shortcut and no window of ours has focus.
+func AlreadyRunningAlert() {
+	walk.MsgBox(nil, "Auto Image Converter",
+		"Auto Image Converter is already running.\n\nLook for its icon in the notification area (system tray) to open the settings window.",
+		walk.MsgBoxIconInformation|walk.MsgBoxOK|walk.MsgBoxTopMost|walk.MsgBoxSetForeground)
+}
+
 // browseFolder shows the folder picker seeded with current and returns the
 // chosen path.
 func browseFolder(owner walk.Form, current string) (string, bool) {
