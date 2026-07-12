@@ -158,6 +158,7 @@ func editJobDialog(owner walk.Form, title string, jc config.JobConfig) (config.J
 	if err != nil {
 		return jc, false
 	}
+	applyWindowChrome(dlg)
 
 	if dlg.Run() != walk.DlgCmdOK || !accepted {
 		return jc, false
@@ -243,6 +244,7 @@ func dropOnceDialog(owner walk.Form, fileCount int) (convert.JobSpec, bool) {
 	if err != nil {
 		return convert.JobSpec{}, false
 	}
+	applyWindowChrome(dlg)
 	if dlg.Run() != walk.DlgCmdOK || !accepted {
 		return convert.JobSpec{}, false
 	}

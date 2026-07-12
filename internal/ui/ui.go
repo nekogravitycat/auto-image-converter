@@ -19,6 +19,7 @@ import (
 
 	"github.com/tailscale/walk"
 	. "github.com/tailscale/walk/declarative"
+	"github.com/tailscale/win"
 	"golang.org/x/sys/windows"
 
 	"github.com/nekogravitycat/auto-image-converter/internal/autostart"
@@ -103,6 +104,16 @@ func Run(ctx context.Context, mgr *manager.Manager, log *logx.Logger, logPath st
 	return nil
 }
 
+// applyWindowChrome gives a top-level window the Windows 11 Mica backdrop
+// material on its title bar. The window stays in light mode regardless of the
+// system theme: walk's client-area controls have no dark theme, and a dark
+// title bar over a light client area looks mismatched. Older Windows versions
+// reject the call with ErrUnsupportedOnThisWindowsVersion, which is fine to
+// ignore.
+func applyWindowChrome(w walk.Win32Window) {
+	_ = w.SetSystemBackdrop(win.DWMSBT_MAINWINDOW)
+}
+
 // build constructs the main window and the tray icon.
 func (u *UI) build() error {
 	appIcon := walk.IconApplication()
@@ -163,6 +174,8 @@ func (u *UI) build() error {
 	}).Create(); err != nil {
 		return err
 	}
+
+	applyWindowChrome(u.mw)
 
 	// MainWindow always creates a built-in menu bar, tool bar, and status bar.
 	// The empty tool bar is nonetheless a visible window parked across the top
