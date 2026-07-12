@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
 )
 
@@ -17,13 +16,12 @@ import (
 // on machines without the HEIF runtime.
 func TestHEIFIntegration(t *testing.T) {
 	script, _ := filepath.Abs(filepath.Join("..", "..", "tools", "heif_convert.py"))
-	cfg := config.Config{Converter: config.ConverterConfig{TargetFormat: config.FormatHEIF, Quality: 90}}
 	log, _ := logx.New(filepath.Join(t.TempDir(), "t.log"))
 	defer log.Close()
-	c := New(cfg, log, script)
-	defer c.Close()
+	e := NewEngine(1, true, log, script)
+	defer e.Close()
 
-	if err := c.checkHEIFEnvironment(); err != nil {
+	if err := e.checkHEIFEnvironment(); err != nil {
 		t.Skipf("HEIF environment not available: %v", err)
 	}
 
@@ -37,7 +35,7 @@ func TestHEIFIntegration(t *testing.T) {
 	}
 	dst := filepath.Join(t.TempDir(), "out.heic")
 
-	if err := c.encodeHEIFFile(src, dst); err != nil {
+	if err := e.encodeHEIFFile(src, dst, 90); err != nil {
 		t.Fatalf("encodeHEIFFile: %v", err)
 	}
 	info, err := os.Stat(dst)

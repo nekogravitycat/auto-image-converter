@@ -24,10 +24,12 @@ const maxLogBytes = 5 << 20 // 5 MiB
 
 // Logger writes timestamped, leveled messages to a size-rotated file (and also
 // to stderr, which is useful for console builds and harmlessly discarded by the
-// windowsgui build).
+// windowsgui build). Additional sinks — such as the UI activity feed — can be
+// attached at runtime with AddSink.
 type Logger struct {
 	l    *log.Logger
 	file *rotatingWriter // nil when the file could not be opened (stderr only)
+	fan  *fanoutWriter
 }
 
 // New creates a Logger that appends to the file at path, rotating it by size. If
@@ -35,17 +37,32 @@ type Logger struct {
 // together with the error, so the application can still run and report
 // diagnostics.
 func New(path string) (*Logger, error) {
+	fan := &fanoutWriter{}
 	rw, err := newRotatingWriter(path, maxLogBytes)
 	if err != nil {
-		return &Logger{l: log.New(os.Stderr, "", log.LstdFlags)}, fmt.Errorf("could not open log file %s: %w", path, err)
+		fan.add(os.Stderr)
+		return &Logger{l: log.New(fan, "", log.LstdFlags), fan: fan}, fmt.Errorf("could not open log file %s: %w", path, err)
 	}
 	// Write to both the file and stderr; stderr is harmless (and useful) for
 	// console builds and simply goes nowhere for the windowsgui build.
-	writer := io.MultiWriter(rw, os.Stderr)
+	fan.add(rw)
+	fan.add(os.Stderr)
 	return &Logger{
-		l:    log.New(writer, "", log.LstdFlags),
+		l:    log.New(fan, "", log.LstdFlags),
 		file: rw,
+		fan:  fan,
 	}, nil
+}
+
+// AddSink registers a callback that receives every subsequent log line (already
+// formatted, including the trailing newline). The UI uses it to mirror recent
+// activity. The callback must be safe to call from any goroutine and should not
+// block; the log's write path holds a lock while invoking it.
+func (lg *Logger) AddSink(fn func(line string)) {
+	lg.fan.add(writerFunc(func(p []byte) (int, error) {
+		fn(string(p))
+		return len(p), nil
+	}))
 }
 
 // Infof logs an informational message.
@@ -70,6 +87,35 @@ func (lg *Logger) Close() error {
 	}
 	return nil
 }
+
+// fanoutWriter writes each message to every registered sink under a lock, so
+// log output can be duplicated to the file, stderr, and any runtime sinks (like
+// the UI activity feed) atomically. Each log.Logger call issues exactly one
+// Write, so each sink receives one whole line per message.
+type fanoutWriter struct {
+	mu      sync.Mutex
+	writers []io.Writer
+}
+
+func (f *fanoutWriter) add(w io.Writer) {
+	f.mu.Lock()
+	f.writers = append(f.writers, w)
+	f.mu.Unlock()
+}
+
+func (f *fanoutWriter) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, w := range f.writers {
+		_, _ = w.Write(p)
+	}
+	return len(p), nil
+}
+
+// writerFunc adapts a plain function into an io.Writer.
+type writerFunc func(p []byte) (int, error)
+
+func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
 
 // rotatingWriter is an io.Writer backed by a file that is rotated once it grows
 // past maxSize. It is safe for concurrent use, matching log.Logger's guarantee.

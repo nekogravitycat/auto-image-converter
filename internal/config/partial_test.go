@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -23,41 +24,50 @@ func seedConfig(t *testing.T, content string) string {
 // rewrites the file so a reload is clean.
 func TestLoadPreservesValidValuesAndFillsMissing(t *testing.T) {
 	path := seedConfig(t, `
-watcher:
-  watch_directory: "C:\\shots"
-  enabled: false
-  recursive: false
-converter:
-  target_format: "HEIF"
+app:
+  max_workers: 3
+jobs:
+  - name: "Shots"
+    watch_directory: "C:\\shots"
+    enabled: false
+    recursive: false
+    target_format: "HEIF"
 `)
 	cfg, warnings, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	if cfg.App.MaxWorkers != 3 {
+		t.Errorf("max_workers = %d, want preserved 3", cfg.App.MaxWorkers)
+	}
+	if len(cfg.Jobs) != 1 {
+		t.Fatalf("job count = %d, want 1", len(cfg.Jobs))
+	}
+	job := cfg.Jobs[0]
 
 	// Preserved values (the false booleans prove missing != present-zero):
-	if cfg.Watcher.WatchDirectory != `C:\shots` {
-		t.Errorf("watch_directory = %q, want preserved", cfg.Watcher.WatchDirectory)
+	if job.WatchDirectory != `C:\shots` {
+		t.Errorf("watch_directory = %q, want preserved", job.WatchDirectory)
 	}
-	if cfg.Watcher.Enabled {
+	if job.Enabled {
 		t.Errorf("enabled = true, want preserved false")
 	}
-	if cfg.Watcher.Recursive {
+	if job.Recursive {
 		t.Errorf("recursive = true, want preserved false")
 	}
-	if cfg.Converter.TargetFormat != FormatHEIF {
-		t.Errorf("target_format = %q, want preserved HEIF", cfg.Converter.TargetFormat)
+	if job.TargetFormat != FormatHEIF {
+		t.Errorf("target_format = %q, want preserved HEIF", job.TargetFormat)
 	}
 
 	// Filled from defaults:
-	if !cfg.Watcher.BatchOnStartup {
+	if !job.BatchOnStartup {
 		t.Errorf("batch_on_startup = false, want default true")
 	}
-	if cfg.Converter.Quality != generatedQuality {
-		t.Errorf("quality = %d, want default %d", cfg.Converter.Quality, generatedQuality)
+	if job.Mode != ModeMonitor {
+		t.Errorf("mode = %q, want default %q", job.Mode, ModeMonitor)
 	}
-	if cfg.Converter.MaxWorkers != defaultWorkers {
-		t.Errorf("max_workers = %d, want default %d", cfg.Converter.MaxWorkers, defaultWorkers)
+	if job.Quality != generatedQuality {
+		t.Errorf("quality = %d, want default %d", job.Quality, generatedQuality)
 	}
 	if len(warnings) == 0 {
 		t.Fatal("expected warnings about missing settings")
@@ -72,7 +82,7 @@ converter:
 	if len(warnings2) != 0 {
 		t.Errorf("reload should produce no warnings, got: %v", warnings2)
 	}
-	if reloaded != cfg {
+	if !reflect.DeepEqual(reloaded, cfg) {
 		t.Errorf("reloaded config differs from first load:\n first=%+v\n second=%+v", cfg, reloaded)
 	}
 }
@@ -81,20 +91,22 @@ converter:
 // removed from the rewritten file, while valid siblings are preserved.
 func TestLoadDropsUnknownFields(t *testing.T) {
 	path := seedConfig(t, `
-watcher:
-  watch_directory: "C:\\shots"
+app:
+  max_workers: 4
   bogus_option: 123
-converter:
-  target_format: "JPEG"
-  quality: 70
+jobs:
+  - name: "Shots"
+    watch_directory: "C:\\shots"
+    target_format: "JPEG"
+    quality: 70
 mystery: true
 `)
 	cfg, warnings, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Converter.Quality != 70 {
-		t.Errorf("quality = %d, want preserved 70", cfg.Converter.Quality)
+	if len(cfg.Jobs) != 1 || cfg.Jobs[0].Quality != 70 {
+		t.Errorf("quality not preserved: %+v", cfg.Jobs)
 	}
 
 	foundUnknown := false
@@ -118,22 +130,25 @@ mystery: true
 // preserved, rather than the whole file being discarded.
 func TestLoadRecoversFromWrongType(t *testing.T) {
 	path := seedConfig(t, `
-watcher:
-  watch_directory: "C:\\shots"
-converter:
-  quality: "high"
+jobs:
+  - name: "Shots"
+    watch_directory: "C:\\shots"
+    quality: "high"
 `)
 	cfg, warnings, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load should recover from one wrong-typed field, got error: %v", err)
 	}
-	if cfg.Watcher.WatchDirectory != `C:\shots` {
-		t.Errorf("watch_directory = %q, want preserved", cfg.Watcher.WatchDirectory)
+	if len(cfg.Jobs) != 1 {
+		t.Fatalf("job count = %d, want 1", len(cfg.Jobs))
+	}
+	if cfg.Jobs[0].WatchDirectory != `C:\shots` {
+		t.Errorf("watch_directory = %q, want preserved", cfg.Jobs[0].WatchDirectory)
 	}
 	// A wrong-typed scalar is coerced to its zero value by yaml, then corrected
 	// to a valid default; either way it must land in range, not stay as garbage.
-	if cfg.Converter.Quality < 1 || cfg.Converter.Quality > 100 {
-		t.Errorf("quality = %d, want a valid in-range default after wrong type", cfg.Converter.Quality)
+	if q := cfg.Jobs[0].Quality; q < 1 || q > 100 {
+		t.Errorf("quality = %d, want a valid in-range default after wrong type", q)
 	}
 	if len(warnings) == 0 {
 		t.Error("expected a warning for the wrong-typed quality field")
@@ -143,13 +158,13 @@ converter:
 // TestLoadFullCorruptionReturnsError checks that genuinely unparseable YAML is
 // still treated as fatal (safe defaults + error), not silently rewritten.
 func TestLoadFullCorruptionReturnsError(t *testing.T) {
-	path := seedConfig(t, "watcher: [unterminated: flow: sequence")
+	path := seedConfig(t, "app: [unterminated: flow: sequence")
 	cfg, _, err := Load(path)
 	if err == nil {
 		t.Fatal("expected an error for unparseable YAML")
 	}
 	// Safe defaults are still returned so the caller can carry on.
-	if cfg.Converter.Quality != fallbackQuality {
-		t.Errorf("quality = %d, want safe default %d on corruption", cfg.Converter.Quality, fallbackQuality)
+	if cfg.App.MaxWorkers != defaultWorkers {
+		t.Errorf("max_workers = %d, want safe default %d on corruption", cfg.App.MaxWorkers, defaultWorkers)
 	}
 }

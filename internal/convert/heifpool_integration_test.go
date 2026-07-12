@@ -11,30 +11,29 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
 )
 
-// newHEIFTestConverter builds a HEIF Converter and skips the test when the
-// Python + pillow-heif runtime is unavailable, so these tests never break CI on
-// machines without the HEIF stack.
-func newHEIFTestConverter(t *testing.T, workers int) *Converter {
+// newHEIFTestEngine builds a HEIF Engine and skips the test when the Python +
+// pillow-heif runtime is unavailable, so these tests never break CI on machines
+// without the HEIF stack.
+func newHEIFTestEngine(t *testing.T, workers int) *Engine {
 	t.Helper()
 	script, _ := filepath.Abs(filepath.Join("..", "..", "tools", "heif_convert.py"))
-	cfg := config.Config{Converter: config.ConverterConfig{
-		TargetFormat: config.FormatHEIF, Quality: 90, MaxWorkers: workers,
-	}}
 	log, _ := logx.New(filepath.Join(t.TempDir(), "t.log"))
 	t.Cleanup(func() { log.Close() })
 
-	c := New(cfg, log, script)
-	t.Cleanup(c.Close)
+	e := NewEngine(workers, true, log, script)
+	t.Cleanup(e.Close)
 
-	if err := c.checkHEIFEnvironment(); err != nil {
+	if err := e.checkHEIFEnvironment(); err != nil {
 		t.Skipf("HEIF environment not available: %v", err)
 	}
-	return c
+	return e
 }
+
+// heifQuality is the quality used by the HEIF integration tests.
+const heifQuality = 90
 
 // writePNG writes a tiny valid PNG and returns its path.
 func writePNG(t *testing.T, path string) string {
@@ -53,7 +52,7 @@ func writePNG(t *testing.T, path string) string {
 // that only the first conversion pays the interpreter import cost; the rest
 // reuse the already-imported process and are dramatically faster.
 func TestHEIFPoolWarmReuse(t *testing.T) {
-	c := newHEIFTestConverter(t, 1)
+	c := newHEIFTestEngine(t, 1)
 	dir := t.TempDir()
 
 	const n = 12
@@ -63,7 +62,7 @@ func TestHEIFPoolWarmReuse(t *testing.T) {
 		dst := filepath.Join(dir, "out"+strconv.Itoa(i)+".heic")
 
 		start := time.Now()
-		if err := c.encodeHEIFFile(src, dst); err != nil {
+		if err := c.encodeHEIFFile(src, dst, heifQuality); err != nil {
 			t.Fatalf("conversion %d failed: %v", i, err)
 		}
 		elapsed := time.Since(start)
@@ -92,7 +91,7 @@ func TestHEIFPoolWarmReuse(t *testing.T) {
 // TestHEIFPoolSurvivesBadInput proves that a cleanly-failed conversion (bad
 // input) does not poison the worker: the pool keeps serving afterwards.
 func TestHEIFPoolSurvivesBadInput(t *testing.T) {
-	c := newHEIFTestConverter(t, 1)
+	c := newHEIFTestEngine(t, 1)
 	dir := t.TempDir()
 
 	// A file that is not a valid image: the worker should report failure but
@@ -101,14 +100,14 @@ func TestHEIFPoolSurvivesBadInput(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("this is not a png"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.encodeHEIFFile(bad, filepath.Join(dir, "bad.heic")); err == nil {
+	if err := c.encodeHEIFFile(bad, filepath.Join(dir, "bad.heic"), heifQuality); err == nil {
 		t.Fatal("expected an error converting a non-image file")
 	}
 
 	// The very next conversion must still work, using the same live worker.
 	good := writePNG(t, filepath.Join(dir, "good.png"))
 	dst := filepath.Join(dir, "good.heic")
-	if err := c.encodeHEIFFile(good, dst); err != nil {
+	if err := c.encodeHEIFFile(good, dst, heifQuality); err != nil {
 		t.Fatalf("pool did not recover after a failed job: %v", err)
 	}
 	if info, err := os.Stat(dst); err != nil || info.Size() == 0 {
@@ -120,7 +119,7 @@ func TestHEIFPoolSurvivesBadInput(t *testing.T) {
 // mirroring how batch/watch drive the pool, and confirms they all succeed.
 func TestHEIFPoolConcurrent(t *testing.T) {
 	const workers = 4
-	c := newHEIFTestConverter(t, workers)
+	c := newHEIFTestEngine(t, workers)
 	dir := t.TempDir()
 
 	const n = 24
@@ -135,7 +134,7 @@ func TestHEIFPoolConcurrent(t *testing.T) {
 			defer func() { <-sem }()
 			src := writePNG(t, filepath.Join(dir, "c_in"+strconv.Itoa(i)+".png"))
 			dst := filepath.Join(dir, "c_out"+strconv.Itoa(i)+".heic")
-			errs[i] = c.encodeHEIFFile(src, dst)
+			errs[i] = c.encodeHEIFFile(src, dst, heifQuality)
 		}(i)
 	}
 	wg.Wait()

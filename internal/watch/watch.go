@@ -1,6 +1,11 @@
-// Package watch monitors the configured directory tree for new PNG files using
+// Package watch monitors a configured directory tree for new PNG files using
 // fsnotify (event-driven; no polling) and converts them once they are fully
 // written.
+//
+// One watcher drives a single job (one monitored folder with its own JobSpec).
+// Concurrency across all jobs is bounded by the shared Engine's worker pool, not
+// by each watcher, so many folders can be watched at once without
+// oversubscribing the CPU.
 package watch
 
 import (
@@ -13,7 +18,6 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/convert"
 	"github.com/nekogravitycat/auto-image-converter/internal/fsutil"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
@@ -33,50 +37,49 @@ const (
 // job).
 const shutdownDrainTimeout = 30 * time.Second
 
-// watcher holds the state needed to react to filesystem events.
+// watcher holds the state needed to react to filesystem events for one job.
 type watcher struct {
-	cfg      config.Config
-	conv     *convert.Converter
+	spec     convert.JobSpec
+	eng      *convert.Engine
 	log      *logx.Logger
 	fsw      *fsnotify.Watcher
 	rules    fsutil.TraversalRules
-	sem      chan struct{}
 	ctx      context.Context // cancelled on shutdown; drives graceful drain
 	wg       sync.WaitGroup  // tracks in-flight conversion goroutines
 	mu       sync.Mutex
 	inFlight map[string]bool
 }
 
-// Run starts watching the configured directory tree and blocks until ctx is
-// cancelled. It returns an error only if the watcher cannot be created.
-func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *logx.Logger) error {
+// Run starts watching the job's directory tree and blocks until ctx is
+// cancelled. Conversions are bounded by the shared Engine's worker pool. It
+// returns an error only if the watcher cannot be created.
+func Run(ctx context.Context, spec convert.JobSpec, eng *convert.Engine, log *logx.Logger) error {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
 	defer fsw.Close()
 
-	rules := conv.TraversalRules()
+	rules := spec.TraversalRules()
 	root := rules.Root
 
 	w := &watcher{
-		cfg:      cfg,
-		conv:     conv,
+		spec:     spec,
+		eng:      eng,
 		log:      log,
 		fsw:      fsw,
 		rules:    rules,
-		sem:      make(chan struct{}, cfg.Converter.MaxWorkers),
 		ctx:      ctx,
 		inFlight: make(map[string]bool),
 	}
 
 	w.addTree(root)
-	log.Infof("watching %s (recursive=%v, max_depth=%d)", root, cfg.Watcher.Recursive, cfg.Watcher.MaxDepth)
+	log.Infof("[%s] watching %s (recursive=%v, max_depth=%d)", spec.Name, root, spec.Recursive, spec.MaxDepth)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Infof("watcher: shutdown requested, waiting for in-flight conversions")
+			log.Infof("[%s] watcher: shutdown requested, waiting for in-flight conversions", spec.Name)
 			w.drain()
 			return nil
 		case event, ok := <-fsw.Events:
@@ -90,7 +93,7 @@ func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *l
 				w.drain()
 				return nil
 			}
-			log.Errorf("watcher error: %v", err)
+			log.Errorf("[%s] watcher error: %v", spec.Name, err)
 		}
 	}
 }
@@ -101,7 +104,7 @@ func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *l
 func (w *watcher) addTree(dir string) {
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			w.log.Warnf("watch setup: cannot access %s: %v", path, err)
+			w.log.Warnf("[%s] watch setup: cannot access %s: %v", w.spec.Name, path, err)
 			if d != nil && d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -114,7 +117,7 @@ func (w *watcher) addTree(dir string) {
 			return filepath.SkipDir
 		}
 		if err := w.fsw.Add(path); err != nil {
-			w.log.Warnf("could not watch directory %s: %v", path, err)
+			w.log.Warnf("[%s] could not watch directory %s: %v", w.spec.Name, path, err)
 		}
 		return nil
 	})
@@ -157,7 +160,7 @@ func (w *watcher) inIgnored(path string) bool {
 }
 
 // schedule converts path once, de-duplicating concurrent events for the same
-// file and bounding total concurrency with the worker semaphore.
+// file and bounding total concurrency with the shared worker pool.
 func (w *watcher) schedule(path string) {
 	w.mu.Lock()
 	if w.inFlight[path] {
@@ -185,15 +188,15 @@ func (w *watcher) schedule(path string) {
 		// would let a few slowly-written files starve the pool so that no actual
 		// conversion can run. The slot bounds encoding concurrency, not waiting.
 		if !waitUntilReady(w.ctx, path) {
-			w.log.Warnf("file not ready or vanished, skipping: %s", path)
+			w.log.Warnf("[%s] file not ready or vanished, skipping: %s", w.spec.Name, path)
 			return
 		}
 
-		w.sem <- struct{}{}
-		defer func() { <-w.sem }()
+		w.eng.Acquire()
+		defer w.eng.Release()
 
-		if err := w.conv.Convert(path); err != nil {
-			w.log.Errorf("conversion failed for %s: %v", path, err)
+		if _, err := w.eng.Convert(w.spec, path); err != nil {
+			w.log.Errorf("[%s] conversion failed for %s: %v", w.spec.Name, path, err)
 		}
 	}()
 }
@@ -211,7 +214,7 @@ func (w *watcher) drain() {
 	select {
 	case <-done:
 	case <-time.After(shutdownDrainTimeout):
-		w.log.Warnf("watcher: in-flight conversions did not finish within %s; they will be terminated", shutdownDrainTimeout)
+		w.log.Warnf("[%s] watcher: in-flight conversions did not finish within %s; they will be terminated", w.spec.Name, shutdownDrainTimeout)
 	}
 }
 

@@ -2,44 +2,38 @@ package control
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/windows"
-
-	"github.com/nekogravitycat/auto-image-converter/internal/logx"
 )
 
-// TestNotifyStop_EventCancelsContext exercises the real Win32 path: after
-// NotifyStop creates the named stop event, setting that event (as stop.ps1
-// does) must cancel the returned context.
-func TestNotifyStop_EventCancelsContext(t *testing.T) {
-	log, _ := logx.New(filepath.Join(t.TempDir(), "test.log"))
-	defer log.Close()
-
-	ctx, stop := NotifyStop(context.Background(), log)
+// TestNotifyStop_ParentCancelCancelsContext confirms NotifyStop derives from its
+// parent: cancelling the parent cancels the returned context. (The signal path
+// is exercised in production; sending a real interrupt to the test process would
+// be disruptive, so the derivation guarantee is what we assert here.)
+func TestNotifyStop_ParentCancelCancelsContext(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, stop := NotifyStop(parent)
 	defer stop()
 
-	// The event exists now (CreateEvent ran synchronously inside NotifyStop).
-	// Open and set it exactly as the stop helper would.
-	name, err := windows.UTF16PtrFromString(StopEventName)
-	if err != nil {
-		t.Fatalf("UTF16PtrFromString: %v", err)
-	}
-	h, err := windows.OpenEvent(windows.EVENT_MODIFY_STATE, false, name)
-	if err != nil {
-		t.Fatalf("OpenEvent: %v", err)
-	}
-	defer windows.CloseHandle(h)
-	if err := windows.SetEvent(h); err != nil {
-		t.Fatalf("SetEvent: %v", err)
-	}
+	cancelParent()
 
 	select {
 	case <-ctx.Done():
-		// success: the waiter observed the event and cancelled the context.
+		// success
 	case <-time.After(5 * time.Second):
-		t.Fatal("context was not cancelled after the stop event was set")
+		t.Fatal("context was not cancelled after the parent was cancelled")
+	}
+}
+
+// TestNotifyStop_StopReleases confirms the returned stop function cancels the
+// context (releasing the signal registration).
+func TestNotifyStop_StopReleases(t *testing.T) {
+	ctx, stop := NotifyStop(context.Background())
+	stop()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("context was not cancelled after stop() was called")
 	}
 }

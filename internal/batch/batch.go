@@ -1,5 +1,7 @@
-// Package batch performs a one-time scan of the watch directory and converts
-// all existing PNG files in parallel, bounded by the configured worker count.
+// Package batch performs a one-time scan of a directory and converts all
+// existing PNG files in parallel, bounded by the shared worker pool. It is used
+// for a job's startup batch, for "convert now" actions, for one-time jobs, and
+// for ad-hoc (drag-and-drop) conversions.
 package batch
 
 import (
@@ -8,9 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/convert"
 	"github.com/nekogravitycat/auto-image-converter/internal/fsutil"
 	"github.com/nekogravitycat/auto-image-converter/internal/logx"
@@ -22,40 +24,76 @@ import (
 // cleanup job).
 const shutdownDrainTimeout = 30 * time.Second
 
-// Run scans the watch directory for existing PNG files (respecting the
+// Summary reports the outcome of a batch run, for notifications and logging.
+type Summary struct {
+	Converted  int
+	Failed     int
+	BytesSaved int64
+}
+
+// Run scans the job's watch directory for existing PNG files (respecting the
 // recursion and depth settings, and skipping the output subtree) and converts
-// them concurrently, capped at cfg.Converter.MaxWorkers.
+// them concurrently, bounded by the shared Engine's worker pool.
 //
 // Run honours ctx for graceful shutdown: once ctx is cancelled it stops
 // launching new conversions and waits for the in-flight ones to finish. Because
 // each conversion writes to a temp file and only renames it into place when
 // complete, letting the in-flight ones drain never leaves a partial output
 // behind — an interrupted batch simply stops early with no stray temp files.
-func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *logx.Logger) {
-	rules := conv.TraversalRules()
+func Run(ctx context.Context, spec convert.JobSpec, eng *convert.Engine, log *logx.Logger) Summary {
+	rules := spec.TraversalRules()
 	root := rules.Root
 
 	files := collectPNGs(root, rules, log)
-	if len(files) == 0 {
-		log.Infof("startup batch: no existing PNG files found in %s", root)
-		return
-	}
-	log.Infof("startup batch: converting %d existing PNG file(s)", len(files))
+	return runFiles(ctx, spec, eng, log, files)
+}
 
-	semaphore := make(chan struct{}, cfg.Converter.MaxWorkers)
-	var wg sync.WaitGroup
+// RunFiles converts an explicit set of files (used for drag-and-drop / ad-hoc
+// conversions), skipping any that are not PNGs. Each file is converted with the
+// given spec; the spec's output/post-action settings decide where results go.
+func RunFiles(ctx context.Context, spec convert.JobSpec, eng *convert.Engine, log *logx.Logger, files []string) Summary {
+	var pngs []string
+	for _, f := range files {
+		if convert.IsPNG(f) {
+			pngs = append(pngs, f)
+		}
+	}
+	return runFiles(ctx, spec, eng, log, pngs)
+}
+
+// runFiles converts the given PNG paths concurrently, bounded by the shared
+// worker pool, and returns a summary of the outcome.
+func runFiles(ctx context.Context, spec convert.JobSpec, eng *convert.Engine, log *logx.Logger, files []string) Summary {
+	if len(files) == 0 {
+		log.Infof("[%s] batch: no PNG files to convert", spec.Name)
+		return Summary{}
+	}
+	log.Infof("[%s] batch: converting %d PNG file(s)", spec.Name, len(files))
+
+	var (
+		converted, failed atomic.Int64
+		saved             atomic.Int64
+		wg                sync.WaitGroup
+	)
 	for i, file := range files {
 		if ctx.Err() != nil {
-			log.Infof("startup batch: shutdown requested, skipping %d remaining file(s)", len(files)-i)
+			log.Infof("[%s] batch: shutdown requested, skipping %d remaining file(s)", spec.Name, len(files)-i)
 			break
 		}
 		wg.Add(1)
-		semaphore <- struct{}{}
+		eng.Acquire()
 		go func(path string) {
 			defer wg.Done()
-			defer func() { <-semaphore }()
-			if err := conv.Convert(path); err != nil {
-				log.Errorf("batch conversion failed for %s: %v", path, err)
+			defer eng.Release()
+			res, err := eng.Convert(spec, path)
+			if err != nil {
+				failed.Add(1)
+				log.Errorf("[%s] batch conversion failed for %s: %v", spec.Name, path, err)
+				return
+			}
+			converted.Add(1)
+			if d := res.OriginalBytes - res.OutputBytes; d > 0 {
+				saved.Add(d)
 			}
 		}(file)
 	}
@@ -66,14 +104,20 @@ func Run(ctx context.Context, cfg config.Config, conv *convert.Converter, log *l
 		// on a wedged one.
 		select {
 		case <-done:
-			log.Infof("startup batch: stopped after in-flight conversions completed")
+			log.Infof("[%s] batch: stopped after in-flight conversions completed", spec.Name)
 		case <-time.After(shutdownDrainTimeout):
-			log.Warnf("startup batch: in-flight conversions did not finish within %s; they will be terminated", shutdownDrainTimeout)
+			log.Warnf("[%s] batch: in-flight conversions did not finish within %s; they will be terminated", spec.Name, shutdownDrainTimeout)
 		}
-		return
+	} else {
+		<-done
+		log.Infof("[%s] batch: finished", spec.Name)
 	}
-	<-done
-	log.Infof("startup batch: finished")
+
+	return Summary{
+		Converted:  int(converted.Load()),
+		Failed:     int(failed.Load()),
+		BytesSaved: saved.Load(),
+	}
 }
 
 // waitDone returns a channel that is closed once wg's counter reaches zero, so
@@ -94,24 +138,27 @@ func waitDone(wg *sync.WaitGroup) <-chan struct{} {
 // Such a temp is always safe to remove: a conversion writes to the temp name
 // and only renames it into place — and only deletes the original PNG — after
 // the output is fully verified, so a leftover temp is incomplete work that will
-// simply be redone. It sweeps the watched tree within the configured
+// simply be redone. It sweeps the job's watched tree within the configured
 // recursion/depth scope and, in output_folder mode, the output tree as well,
 // since that is where converted files (and thus their temps) are written.
-func SweepTemps(cfg config.Config, conv *convert.Converter, log *logx.Logger) {
-	rules := conv.TraversalRules()
+func SweepTemps(spec convert.JobSpec, log *logx.Logger) int {
+	rules := spec.TraversalRules()
 	removed := sweepTree(rules.Root, rules, log)
 
 	// In output_folder mode the converted files live under the output root,
 	// which the walk above deliberately excludes (or may never reach). Sweep it
 	// fully so temps there are cleaned up too.
-	if cfg.FileManagement.PostAction == config.ActionOutputFolder {
-		outRoot := fsutil.AbsClean(cfg.FileManagement.OutputDirectory)
-		removed += sweepTree(outRoot, fsutil.TraversalRules{Root: outRoot, Recursive: true}, log)
+	if ignored, ok := spec.IgnoredDir(); ok {
+		removed += sweepTree(ignored, fsutil.TraversalRules{Root: ignored, Recursive: true}, log)
+	} else if spec.PostAction != "replace" && spec.OutputDir != "" {
+		// output_folder mode with the output root outside the watch tree.
+		removed += sweepTree(spec.OutputDir, fsutil.TraversalRules{Root: spec.OutputDir, Recursive: true}, log)
 	}
 
 	if removed > 0 {
-		log.Infof("startup cleanup: removed %d orphaned temporary file(s)", removed)
+		log.Infof("[%s] startup cleanup: removed %d orphaned temporary file(s)", spec.Name, removed)
 	}
+	return removed
 }
 
 // sweepTree walks root within rules and deletes any conversion temp files it

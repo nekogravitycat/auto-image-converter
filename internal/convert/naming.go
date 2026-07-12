@@ -19,14 +19,14 @@ import (
 //
 // The returned path is guaranteed not to collide with an existing file: if the
 // natural name is taken, a numeric suffix is appended (e.g. shot-1.jpg).
-func (c *Converter) outputPath(srcPath string) (string, error) {
-	ext := c.cfg.OutputExtension()
+func (s JobSpec) outputPath(srcPath string) (string, error) {
+	ext := s.OutputExtension()
 	stem := strings.TrimSuffix(filepath.Base(srcPath), filepath.Ext(srcPath))
 	fileName := stem + ext
 
 	var destDir string
-	if c.cfg.FileManagement.PostAction == config.ActionOutputFolder {
-		destDir = c.mirroredDir(srcPath)
+	if s.PostAction == config.ActionOutputFolder {
+		destDir = s.mirroredDir(srcPath)
 	} else {
 		destDir = filepath.Dir(srcPath)
 	}
@@ -41,13 +41,13 @@ func (c *Converter) outputPath(srcPath string) (string, error) {
 // mirroredDir returns the directory under the output root that mirrors the
 // source file's location relative to the watch root. Sources outside the watch
 // root are placed directly in the output root.
-func (c *Converter) mirroredDir(srcPath string) string {
+func (s JobSpec) mirroredDir(srcPath string) string {
 	srcDir := filepath.Dir(fsutil.AbsClean(srcPath))
-	rel, err := filepath.Rel(c.watchRoot, srcDir)
+	rel, err := filepath.Rel(s.WatchDir, srcDir)
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-		return c.outputRoot
+		return s.OutputDir
 	}
-	return filepath.Join(c.outputRoot, rel)
+	return filepath.Join(s.OutputDir, rel)
 }
 
 // ensureUnique returns path unchanged if no file exists there; otherwise it
