@@ -1,6 +1,7 @@
 # Runtime-generated files (created next to the executable at run time)
 config.yml
 *.log
+stats.json
 
 # OS cruft
 Thumbs.db
