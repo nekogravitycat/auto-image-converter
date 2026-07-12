@@ -138,6 +138,12 @@ func (w *watcher) handleEvent(e fsnotify.Event) {
 		// A new subdirectory: start watching it (and its allowed descendants).
 		if e.Op&fsnotify.Create != 0 && !w.rules.PruneDir(e.Name) {
 			w.addTree(e.Name)
+			// Files already inside it produce no events of their own — a
+			// same-volume folder move is atomic, so the directory appears with
+			// its contents already in place — and files written between the
+			// directory's creation and the watch being installed are missed
+			// too. Scan it once so neither case is silently skipped.
+			w.scheduleExisting(e.Name)
 		}
 		return
 	}
@@ -149,6 +155,30 @@ func (w *watcher) handleEvent(e fsnotify.Event) {
 		return
 	}
 	w.schedule(e.Name)
+}
+
+// scheduleExisting converts the PNG files already present under dir, within the
+// job's traversal rules. schedule de-duplicates against anything the event loop
+// picks up concurrently, so a file seen both ways is still converted only once.
+func (w *watcher) scheduleExisting(dir string) {
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			if w.rules.PruneDir(path) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if convert.IsPNG(path) && !w.inIgnored(path) {
+			w.schedule(path)
+		}
+		return nil
+	})
 }
 
 // inIgnored reports whether path lies within the excluded output subtree.
