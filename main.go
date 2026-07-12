@@ -5,8 +5,8 @@
 // offers one-time conversions and drag-and-drop.
 //
 // It is built with -ldflags="-H=windowsgui" so it runs without a console window;
-// all diagnostics are written to a log file next to the executable and mirrored
-// into the window's activity view.
+// all diagnostics are written to a log file next to the executable, which the
+// window's "Open log" button follows live in a terminal.
 package main
 
 import (
@@ -74,7 +74,7 @@ func main() {
 	// Open the window on first run (no jobs yet); otherwise honor the preference.
 	startMinimized := cfg.App.StartMinimized && len(cfg.Jobs) > 0
 
-	if err := ui.Run(ctx, mgr, log, startMinimized); err != nil {
+	if err := ui.Run(ctx, mgr, log, appPaths.LogFile, startMinimized); err != nil {
 		log.Errorf("UI failed to start: %v", err)
 	}
 

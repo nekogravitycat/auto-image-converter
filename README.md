@@ -22,9 +22,9 @@ and post-action, and either watch a folder continuously or convert it just once.
   oversubscribe the CPU. HEIF workers share one warm pool too.
 - **Drag-and-drop** — drop files or folders onto the window to convert them once,
   without creating a permanent job.
-- **Live activity & stats** — the window shows a running activity log and totals
-  (files converted, disk space saved); tray balloons announce batch completion
-  and errors.
+- **Stats & notifications** — the window shows running totals (files converted,
+  disk space saved) and tray balloons announce batch completion and errors; the
+  **Open log** button opens a terminal that follows the log file live.
 - **Launch at login** — a checkbox toggles a per-user startup entry (no manual
   shortcut needed).
 - **Background watcher** — reacts to new PNGs the moment they are written, using

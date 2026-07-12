@@ -11,13 +11,15 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/walk"
 	. "github.com/tailscale/walk/declarative"
+	"golang.org/x/sys/windows"
 
 	"github.com/nekogravitycat/auto-image-converter/internal/autostart"
 	"github.com/nekogravitycat/auto-image-converter/internal/config"
@@ -26,19 +28,16 @@ import (
 	"github.com/nekogravitycat/auto-image-converter/internal/manager"
 )
 
-// maxLogLines bounds the in-memory activity buffer shown in the window.
-const maxLogLines = 500
-
 // UI holds the widgets and wiring for the application window and tray icon.
 type UI struct {
-	mgr *manager.Manager
-	log *logx.Logger
+	mgr     *manager.Manager
+	log     *logx.Logger
+	logPath string
 
 	mw          *walk.MainWindow
 	ni          *walk.NotifyIcon
 	model       *jobModel
 	tv          *walk.TableView
-	logBox      *walk.TextEdit
 	statsLabel  *walk.Label
 	workersEdit *walk.NumberEdit
 	autostartCB *walk.CheckBox
@@ -46,30 +45,25 @@ type UI struct {
 	pauseAction *walk.Action
 
 	loading bool // suppresses change handlers while initializing controls
-
-	logMu    sync.Mutex
-	logLines []string
-	logDirty bool
 }
 
 // Run builds the window and tray, wires up and starts the manager, and runs the
 // message loop until the user chooses Exit or ctx is cancelled (an OS
 // interrupt/logoff). It must be called on the main goroutine. Shutdown of the
 // manager is the caller's responsibility once Run returns.
-func Run(ctx context.Context, mgr *manager.Manager, log *logx.Logger, startMinimized bool) error {
+func Run(ctx context.Context, mgr *manager.Manager, log *logx.Logger, logPath string, startMinimized bool) error {
 	app, err := walk.InitApp()
 	if err != nil {
 		return err
 	}
 
-	u := &UI{mgr: mgr, log: log, model: &jobModel{}}
+	u := &UI{mgr: mgr, log: log, logPath: logPath, model: &jobModel{}}
 	if err := u.build(); err != nil {
 		return err
 	}
 	defer u.ni.Dispose()
 
 	mgr.SetCallbacks(u.onChange, u.onNotify)
-	log.AddSink(u.onLogLine)
 
 	u.refreshTable()
 	u.refreshStats()
@@ -107,7 +101,8 @@ func (u *UI) build() error {
 		AssignTo:    &u.mw,
 		Title:       "Auto Image Converter",
 		Icon:        appIcon,
-		Size:        Size{Width: 760, Height: 560},
+		Size:        Size{Width: 760, Height: 480},
+		MinSize:     Size{Width: 640, Height: 360},
 		Layout:      VBox{},
 		OnDropFiles: u.onDropFiles,
 		Children: []Widget{
@@ -146,16 +141,34 @@ func (u *UI) build() error {
 					CheckBox{AssignTo: &u.autostartCB, Text: "Launch at login", OnCheckedChanged: u.onAutostartChanged},
 				},
 			},
-			Label{Text: "Activity"},
-			TextEdit{AssignTo: &u.logBox, ReadOnly: true, VScroll: true, MinSize: Size{Height: 150}},
-			Label{AssignTo: &u.statsLabel, Text: ""},
+			Composite{
+				Layout: HBox{MarginsZero: true},
+				Children: []Widget{
+					Label{AssignTo: &u.statsLabel, Text: ""},
+					HSpacer{},
+					PushButton{Text: "Open log", ToolTipText: "Open a terminal window that follows the log live", OnClicked: u.onOpenLog},
+				},
+			},
 		},
 	}).Create(); err != nil {
 		return err
 	}
 
+	// MainWindow always creates a built-in menu bar, tool bar, and status bar.
+	// The empty tool bar is nonetheless a visible window parked across the top
+	// of the client area — the layout only reserves room for it once it has
+	// actions — so it covers the top of the first row of controls. This app
+	// uses none of them; hide the ones that paint.
+	u.mw.ToolBar().SetVisible(false)
+	u.mw.StatusBar().SetVisible(false)
+
 	// The close button hides to the tray; the app keeps running in the
 	// background. Exiting is done from the tray menu.
+	//
+	// Cancelling Closing only keeps the window alive: MainWindow's WM_CLOSE
+	// handler ends the message loop regardless of whether the event was
+	// cancelled, so exit-on-close has to be disabled as well.
+	u.mw.SetExitOnClose(false)
 	u.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		*canceled = true
 		u.mw.Hide()
@@ -231,19 +244,8 @@ func (u *UI) onNotify(title, body string, isError bool) {
 	})
 }
 
-func (u *UI) onLogLine(line string) {
-	u.logMu.Lock()
-	u.logLines = append(u.logLines, strings.TrimRight(line, "\r\n"))
-	if len(u.logLines) > maxLogLines {
-		u.logLines = u.logLines[len(u.logLines)-maxLogLines:]
-	}
-	u.logDirty = true
-	u.logMu.Unlock()
-}
-
-// tick periodically refreshes the live-updating parts of the window (stats and
-// the activity log) so a running batch shows progress without flooding the UI
-// with per-file updates.
+// tick periodically refreshes the stats line so a running batch shows progress
+// without flooding the UI with per-file updates.
 func (u *UI) tick(stop <-chan struct{}) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -252,10 +254,7 @@ func (u *UI) tick(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-t.C:
-			walk.App().Synchronize(func() {
-				u.refreshStats()
-				u.refreshLog()
-			})
+			walk.App().Synchronize(u.refreshStats)
 		}
 	}
 }
@@ -276,18 +275,6 @@ func (u *UI) refreshStats() {
 		"Session: %d converted, %d failed, %s saved     |     Total: %d converted, %s saved",
 		ss.Converted, ss.Failed, humanBytes(ss.BytesSaved),
 		ls.Converted, humanBytes(ls.BytesSaved)))
-}
-
-func (u *UI) refreshLog() {
-	u.logMu.Lock()
-	if !u.logDirty {
-		u.logMu.Unlock()
-		return
-	}
-	text := strings.Join(u.logLines, "\r\n")
-	u.logDirty = false
-	u.logMu.Unlock()
-	u.logBox.SetText(text)
 }
 
 func (u *UI) refreshPauseLabel() {
@@ -378,6 +365,26 @@ func (u *UI) onAutostartChanged() {
 	if err := u.mgr.SetAutostart(u.autostartCB.Checked()); err != nil {
 		walk.MsgBox(u.mw, "Autostart", "Could not update launch-at-login setting:\n"+err.Error(), walk.MsgBoxIconError)
 	}
+}
+
+// onOpenLog opens a new terminal window that follows the log file, giving the
+// full history plus live updates without keeping a copy in the window.
+func (u *UI) onOpenLog() {
+	// Single-quoted PowerShell literal: only ' needs escaping (by doubling).
+	quoted := strings.ReplaceAll(u.logPath, "'", "''")
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-Command",
+		"$Host.UI.RawUI.WindowTitle = 'Auto Image Converter log'; Get-Content -LiteralPath '"+quoted+"' -Tail 200 -Wait")
+	// The app itself is a windowsgui binary with no console, so the viewer
+	// must be given its own.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_CONSOLE}
+	if err := cmd.Start(); err != nil {
+		u.log.Errorf("could not open log viewer: %v", err)
+		walk.MsgBox(u.mw, "Open log", "Could not open a log window:\n"+err.Error(), walk.MsgBoxIconError)
+		return
+	}
+	// The viewer outlives or predeceases us independently; just release the
+	// process handle when it exits.
+	go func() { _ = cmd.Wait() }()
 }
 
 func (u *UI) onTogglePause() {

@@ -24,8 +24,7 @@ const maxLogBytes = 5 << 20 // 5 MiB
 
 // Logger writes timestamped, leveled messages to a size-rotated file (and also
 // to stderr, which is useful for console builds and harmlessly discarded by the
-// windowsgui build). Additional sinks — such as the UI activity feed — can be
-// attached at runtime with AddSink.
+// windowsgui build).
 type Logger struct {
 	l    *log.Logger
 	file *rotatingWriter // nil when the file could not be opened (stderr only)
@@ -54,17 +53,6 @@ func New(path string) (*Logger, error) {
 	}, nil
 }
 
-// AddSink registers a callback that receives every subsequent log line (already
-// formatted, including the trailing newline). The UI uses it to mirror recent
-// activity. The callback must be safe to call from any goroutine and should not
-// block; the log's write path holds a lock while invoking it.
-func (lg *Logger) AddSink(fn func(line string)) {
-	lg.fan.add(writerFunc(func(p []byte) (int, error) {
-		fn(string(p))
-		return len(p), nil
-	}))
-}
-
 // Infof logs an informational message.
 func (lg *Logger) Infof(format string, args ...any) {
 	lg.l.Printf("[INFO] "+format, args...)
@@ -89,9 +77,9 @@ func (lg *Logger) Close() error {
 }
 
 // fanoutWriter writes each message to every registered sink under a lock, so
-// log output can be duplicated to the file, stderr, and any runtime sinks (like
-// the UI activity feed) atomically. Each log.Logger call issues exactly one
-// Write, so each sink receives one whole line per message.
+// log output can be duplicated to the file and stderr atomically. Each
+// log.Logger call issues exactly one Write, so each sink receives one whole
+// line per message.
 type fanoutWriter struct {
 	mu      sync.Mutex
 	writers []io.Writer
@@ -111,11 +99,6 @@ func (f *fanoutWriter) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
-
-// writerFunc adapts a plain function into an io.Writer.
-type writerFunc func(p []byte) (int, error)
-
-func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
 
 // rotatingWriter is an io.Writer backed by a file that is rotated once it grows
 // past maxSize. It is safe for concurrent use, matching log.Logger's guarantee.
