@@ -10,7 +10,15 @@ import (
 
 // AbsClean returns a cleaned absolute form of path, falling back to Clean when
 // the absolute path cannot be determined.
+//
+// An empty path stays empty rather than resolving to the current working
+// directory: callers use "" to mean "not set" (e.g. an ad-hoc conversion has no
+// watch root), and silently turning that into the process's CWD would make
+// unrelated files look as though they lived inside it.
 func AbsClean(path string) string {
+	if path == "" {
+		return ""
+	}
 	if abs, err := filepath.Abs(path); err == nil {
 		return filepath.Clean(abs)
 	}
@@ -53,16 +61,28 @@ type TraversalRules struct {
 // PruneDir reports whether the directory at path should be excluded from
 // traversal (i.e. neither scanned nor watched, and not descended into).
 //
-// A directory is pruned when it is the ignored output directory, when recursion
-// is disabled and it is not the root, or when its depth exceeds MaxDepth.
+// The root is never pruned. This matters when the ignored output directory is
+// the root itself (an output_folder job whose output folder is the watched
+// folder): pruning there would silently disable the whole job — no scan, no
+// watcher, no error. Below the root, a directory is pruned when it is (inside)
+// the ignored output directory, when recursion is disabled, or when its depth
+// exceeds MaxDepth.
 func (r TraversalRules) PruneDir(path string) bool {
+	// Normalize both sides of every comparison. Callers normally build the rules
+	// from an already-absolute spec, but a rule that only works for absolute
+	// input is a trap for the next caller.
 	ap := AbsClean(path)
-	if r.HasIgnored && Within(r.IgnoredDir, ap) {
+	root := AbsClean(r.Root)
+
+	if ap == root {
+		return false // always traverse the root
+	}
+	if r.HasIgnored && Within(AbsClean(r.IgnoredDir), ap) {
 		return true
 	}
-	depth := Depth(r.Root, ap)
+	depth := Depth(root, ap)
 	if depth == 0 {
-		return false // always traverse the root
+		return false // unrelated to the root; leave the decision to the walker
 	}
 	if !r.Recursive {
 		return true
