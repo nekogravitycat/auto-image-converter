@@ -8,6 +8,7 @@ import (
 
 	"github.com/tailscale/walk"
 	. "github.com/tailscale/walk/declarative"
+	"github.com/tailscale/win"
 
 	"github.com/nekogravitycat/auto-image-converter/internal/config"
 	"github.com/nekogravitycat/auto-image-converter/internal/convert"
@@ -24,6 +25,23 @@ var (
 	actionValues = []string{config.ActionReplace, config.ActionOutputFolder}
 	actionLabels = []string{"Replace original", "Keep original, write to output folder"}
 )
+
+// alignNumbersLeft switches NumberEdit text from the right alignment walk
+// hardcodes to left, matching the LineEdits around it. The alignment is a
+// style bit on the inner edit control (the NumberEdit's only child while spin
+// buttons are off), and edit controls honor ES_* alignment changes after
+// creation.
+func alignNumbersLeft(edits ...*walk.NumberEdit) {
+	for _, ne := range edits {
+		hwnd := win.GetWindow(ne.Handle(), win.GW_CHILD)
+		if hwnd == 0 {
+			continue
+		}
+		style := uint32(win.GetWindowLong(hwnd, win.GWL_STYLE))
+		win.SetWindowLong(hwnd, win.GWL_STYLE, int32(style&^(win.ES_RIGHT|win.ES_CENTER)))
+		win.InvalidateRect(hwnd, nil, true)
+	}
+}
 
 func indexOf(values []string, v string) int {
 	v = strings.ToLower(strings.TrimSpace(v))
@@ -159,6 +177,7 @@ func editJobDialog(owner walk.Form, title string, jc config.JobConfig) (config.J
 		return jc, false
 	}
 	applyWindowChrome(dlg)
+	alignNumbersLeft(qualityEdit, depthEdit)
 
 	if dlg.Run() != walk.DlgCmdOK || !accepted {
 		return jc, false

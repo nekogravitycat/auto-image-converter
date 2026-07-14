@@ -119,11 +119,16 @@ func (u *UI) build() error {
 	appIcon := walk.IconApplication()
 
 	if err := (MainWindow{
-		AssignTo:    &u.mw,
-		Title:       "Auto Image Converter",
-		Icon:        appIcon,
-		Size:        Size{Width: 760, Height: 480},
-		MinSize:     Size{Width: 640, Height: 360},
+		AssignTo: &u.mw,
+		Title:    "Auto Image Converter",
+		Icon:     appIcon,
+		Size:     Size{Width: 760, Height: 480},
+		MinSize:  Size{Width: 640, Height: 360},
+		// Create the window hidden; Run decides whether to show it, so that
+		// "start minimized to tray" is honored. Leaving Visible unset is not
+		// the same thing: the declarative builder shows the window unless the
+		// property is explicitly false.
+		Visible:     false,
 		Layout:      VBox{},
 		OnDropFiles: u.onDropFiles,
 		Children: []Widget{
